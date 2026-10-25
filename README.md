@@ -27,7 +27,7 @@ It is a diagnostic tool. It does not automatically repair configuration, install
 
 ## Tested platform
 
-Version 1.0.0 has been tested and is working on **AllStarLink 3 (ASL3) running Debian 13 (Trixie)**. It may also work on other ASL3/Debian releases, but those releases have not been verified for this version.
+Version 1.0.1 has been tested and is working on **AllStarLink 3 (ASL3) running Debian 13 (Trixie)**. It may also work on other ASL3/Debian releases, but those releases have not been verified for this version.
 
 ## Requirements
 

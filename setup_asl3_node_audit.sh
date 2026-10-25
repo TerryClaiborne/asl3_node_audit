@@ -559,7 +559,9 @@ sudo -u "$WEB_USER" test ! -w "$APP_DIR/src" || fail "src/ must not be writable 
 sudo -u "$WEB_USER" test -w "$APP_DIR/run/auth" || fail "run/auth must be writable by $WEB_USER"
 sudo -u "$WEB_USER" test ! -w "$APP_DIR/run/web" || fail "run/web must not be writable by $WEB_USER"
 
+echo "[INFO] Running initial Node Audit checks. This may take a few minutes on slower systems..."
 systemctl start asl3-node-audit.service || fail "Initial ASL3 Node Audit monitor run failed."
+echo "[OK] Initial Node Audit checks completed."
 result="$(systemctl show asl3-node-audit.service -p Result --value)"
 status="$(systemctl show asl3-node-audit.service -p ExecMainStatus --value)"
 [[ "$result" == "success" && "$status" == "0" ]] || fail "Initial monitor result was $result/$status"
