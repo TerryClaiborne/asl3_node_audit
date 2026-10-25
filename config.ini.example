@@ -1,0 +1,11 @@
+# ASL3 Node Audit local configuration
+# The installer detects one local app_rpt node from /etc/asterisk/savenode.conf
+# first, then rpt.conf and its immediate includes when detection is unambiguous.
+# If detection is not possible, set MYNODE manually and run setup again.
+MYNODE=""
+
+# Optional application login. Disabled by default.
+# The login page asks only for the password; the administrator name is fixed here.
+ASL3_NODE_AUDIT_AUTH_ENABLED=0
+ASL3_NODE_AUDIT_ADMIN_USER="admin"
+ASL3_NODE_AUDIT_ADMIN_PASSWORD_HASH=""

@@ -1,0 +1,30 @@
+asl3_node_audit/
+|-- .gitignore
+|-- README.md
+|-- VERSION
+|-- config.ini.example
+|-- screenshot-dark.png
+|-- screenshot-light.png
+|-- setup_asl3_node_audit.sh
+|-- tree.txt
+|-- bin/
+|   |-- asl3-node-audit.sh
+|   |-- audit_monitor.py
+|   |-- full_audit.py
+|   |-- monitor_runner.py
+|   `-- security_monitor.py
+|-- public/
+|   |-- app.js
+|   |-- data.php
+|   |-- full-audit-live.js
+|   |-- index.php
+|   |-- live.php
+|   |-- login.php
+|   |-- logout.php
+|   |-- security-live.js
+|   `-- style.css
+`-- src/
+    |-- apt_security.py
+    |-- auth.php
+    |-- monitor_engine.py
+    `-- node_identity.php
