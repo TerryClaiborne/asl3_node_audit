@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Permanent timer entrypoint for security monitoring and the full audit.
+"""On-demand service entrypoint for security monitoring and the full audit.
 
 Security and full-audit failures are reported independently.
 """
@@ -12,7 +12,7 @@ def once():
     sec=subprocess.run(['/usr/bin/python3',str(APP/'bin/security_monitor.py')],env=env,timeout=600)
     if sec.returncode:
         print('WARNING: Critical security refresh failed; full audit still attempted',file=sys.stderr)
-    full=subprocess.run(['/usr/bin/python3',str(APP/'bin/full_audit.py'),'--once'],env=env,timeout=260)
+    full=subprocess.run(['/usr/bin/python3',str(APP/'bin/full_audit.py'),'--once','--force'],env=env,timeout=260)
     if full.returncode:
         print('WARNING: Full audit refresh failed; previous result remains explicitly timestamped',file=sys.stderr)
     return 0 if sec.returncode==0 and full.returncode==0 else 3

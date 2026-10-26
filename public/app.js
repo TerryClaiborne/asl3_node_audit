@@ -60,3 +60,42 @@ function newer(remote,local){const a=parseVersion(remote),b=parseVersion(local);
 async function check(){const brand=document.getElementById('branding-title');if(!brand)return;const local=String(brand.dataset.localVersion||'').trim(),url=String(brand.dataset.versionUrl||'').trim();if(local)brand.title=`ASL3 Node Audit v${local}`;if(!local||!url)return;try{const r=await fetch(url,{method:'GET',cache:'no-store'});if(!r.ok)return;const remote=String(await r.text()).trim();if(newer(remote,local)){brand.classList.add('has-update');brand.title=`ASL3 Node Audit v${local} → v${remote} update available`;brand.setAttribute('aria-label',`Open the ASL3 Node Audit repository. Update available from version ${local} to ${remote}.`)}}catch(e){}}
 check();
 })();
+
+// Request a bounded audit when the dashboard opens, then no more than
+// once every 10 minutes while this dashboard remains visible.
+// refresh.php also enforces the 10-minute gate globally across browser windows.
+(()=>{
+'use strict';
+const token=document.body?.dataset.auditCsrf;
+if(!token)return;
+
+const INTERVAL=10*60*1000;
+let lastAttempt=0;
+
+function requestAudit(){
+ if(document.hidden)return;
+ const now=Date.now();
+ if(lastAttempt&&now-lastAttempt<INTERVAL)return;
+ lastAttempt=now;
+
+ const body=new URLSearchParams();
+ body.set('csrf',token);
+
+ fetch('refresh.php',{
+  method:'POST',
+  cache:'no-store',
+  credentials:'same-origin',
+  headers:{
+   'Accept':'application/json',
+   'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'
+  },
+  body:body.toString()
+ }).catch(()=>{});
+}
+
+requestAudit();
+setInterval(requestAudit,INTERVAL);
+document.addEventListener('visibilitychange',()=>{
+ if(!document.hidden)requestAudit();
+});
+})();

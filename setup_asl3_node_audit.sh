@@ -11,6 +11,7 @@ APACHE_POLLING_NAME="asl3-node-audit-polling"
 APACHE_CONF="/etc/apache2/conf-available/${APACHE_CONF_NAME}.conf"
 APACHE_POLLING_CONF="/etc/apache2/conf-available/${APACHE_POLLING_NAME}.conf"
 SERVICE_FILE="/etc/systemd/system/asl3-node-audit.service"
+PATH_FILE="/etc/systemd/system/asl3-node-audit.path"
 TIMER_FILE="/etc/systemd/system/asl3-node-audit.timer"
 BACKUP_ROOT="/var/backups/asl3-node-audit"
 LOCK_FILE="/run/lock/asl3-node-audit-setup.lock"
@@ -46,7 +47,7 @@ Usage:
 
 Normal setup installs or updates ASL3 Node Audit, preserves local config and
 password hashes, installs only this application's Apache/systemd files, and
-starts the scheduled monitor. No sudoers entry is installed.
+uses an on-demand browser-triggered monitor. No sudoers entry is installed.
 USAGE
     exit 0
     ;;
@@ -56,6 +57,62 @@ esac
 fail() { echo "[ERROR] $*" >&2; exit 1; }
 warn() { echo "[WARN] $*" >&2; }
 ok() { echo "[OK] $*"; }
+
+ensure_shared_polling_hook() {
+  local stock='CustomLog ${APACHE_LOG_DIR}/access.log combined'
+  local shared='CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=!(reqenv('\''dontlog_app_polling'\'') == '\''1'\'' || (reqenv('\''dontlog_app_polling_200'\'') == '\''1'\'' && %{REQUEST_STATUS} == 200))"'
+  local site tmp backup_dir changed=0 warned=0
+  local -a sites=(
+    /etc/apache2/sites-available/000-default.conf
+    /etc/apache2/sites-available/default-ssl.conf
+  )
+
+  for site in "${sites[@]}"; do
+    [[ -f "$site" ]] || continue
+
+    if grep -Fq "$shared" "$site"; then
+      continue
+    fi
+
+    if grep -Fxq "$stock" "$site"; then
+      if [[ -z "${backup_dir:-}" ]]; then
+        backup_dir="$BACKUP_ROOT/apache-accesslog-$(date -u +%Y%m%dT%H%M%SZ)"
+        install -d -o root -g root -m 0700 "$BACKUP_ROOT"
+        install -d -o root -g root -m 0700 "$backup_dir"
+      fi
+
+      cp -a "$site" "$backup_dir/$(basename "$site")"
+
+      tmp="$(mktemp)"
+      awk -v stock="$stock" -v shared="$shared" '
+        $0 == stock { print shared; changed=1; next }
+        { print }
+        END { if (!changed) exit 42 }
+      ' "$site" >"$tmp" || {
+        rm -f "$tmp"
+        fail "Could not install the shared Apache polling-log hook in $site."
+      }
+
+      cat "$tmp" >"$site"
+      rm -f "$tmp"
+      changed=1
+      continue
+    fi
+
+    if grep -Eq '^[[:space:]]*CustomLog[[:space:]].*access\.log' "$site"; then
+      warn "$site has a custom access-log directive; leaving it untouched."
+      warn "Successful ASL3 Node Audit background requests may remain in access.log for that site."
+      warned=1
+    fi
+  done
+
+  if (( changed )); then
+    echo "[INFO] Installed the shared Apache polling-log hook without changing normal request logging."
+    [[ -z "${backup_dir:-}" ]] || echo "[INFO] Apache log backup: $backup_dir"
+  elif (( ! warned )); then
+    echo "[INFO] Shared Apache polling-log hook already present; existing app logging rules left untouched."
+  fi
+}
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || fail "Run this installer with sudo or as root."
 mkdir -p /run/lock
@@ -273,7 +330,7 @@ restore_backup() {
     "$APACHE_CONF:apache.conf:no-apache-conf" \
     "$APACHE_POLLING_CONF:apache-polling.conf:no-apache-polling" \
     "$SERVICE_FILE:service:no-service" \
-    "$TIMER_FILE:timer:no-timer"; do
+    "$PATH_FILE:path:no-path"; do
     IFS=: read -r target saved absent <<< "$pair"
     if [[ -f "$dir/$saved" ]]; then install -o root -g root -m 0644 "$dir/$saved" "$target";
     elif [[ -f "$dir/$absent" ]]; then rm -f "$target"; fi
@@ -283,8 +340,22 @@ restore_backup() {
     if [[ -f "$dir/apache-enabled" ]]; then a2enconf "$APACHE_CONF_NAME" >/dev/null 2>&1 || true; else a2disconf "$APACHE_CONF_NAME" >/dev/null 2>&1 || true; fi
     if [[ -f "$dir/apache-polling-enabled" ]]; then a2enconf "$APACHE_POLLING_NAME" >/dev/null 2>&1 || true; else a2disconf "$APACHE_POLLING_NAME" >/dev/null 2>&1 || true; fi
   fi
+  # v1.0.1's permanent timer is retired and must never be resurrected.
+  systemctl disable --now asl3-node-audit.timer >/dev/null 2>&1 || true
+  rm -f "$TIMER_FILE"
+
+  # Backups made before v1.0.2 have no path-unit markers.
+  if [[ ! -f "$dir/path" && ! -f "$dir/no-path" ]]; then
+    rm -f "$PATH_FILE"
+  fi
+
   systemctl daemon-reload >/dev/null 2>&1 || true
-  if [[ -f "$dir/timer-enabled" ]]; then systemctl enable --now asl3-node-audit.timer >/dev/null 2>&1 || true; else systemctl disable --now asl3-node-audit.timer >/dev/null 2>&1 || true; fi
+
+  if [[ -f "$dir/path-enabled" && -f "$PATH_FILE" ]]; then
+    systemctl enable --now asl3-node-audit.path >/dev/null 2>&1 || true
+  else
+    systemctl disable --now asl3-node-audit.path >/dev/null 2>&1 || true
+  fi
   if apache2ctl configtest >/dev/null 2>&1; then systemctl reload apache2.service >/dev/null 2>&1 || true; fi
   ok "Installer-managed configuration restored from $dir"
 }
@@ -299,7 +370,7 @@ make_backup() {
   local stamp dir
   [[ ! -L "$BACKUP_ROOT" ]] || fail "Unsafe backup-root symlink: $BACKUP_ROOT"
   [[ ! -L "$CONFIG_FILE" ]] || fail "Unsafe config.ini symlink: $CONFIG_FILE"
-  for managed in "$APACHE_CONF" "$APACHE_POLLING_CONF" "$SERVICE_FILE" "$TIMER_FILE"; do
+  for managed in "$APACHE_CONF" "$APACHE_POLLING_CONF" "$SERVICE_FILE" "$PATH_FILE" "$TIMER_FILE"; do
     [[ ! -L "$managed" ]] || fail "Unsafe managed-file symlink: $managed"
   done
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -312,7 +383,14 @@ make_backup() {
   if [[ -f "$APACHE_CONF" ]]; then cp -a "$APACHE_CONF" "$dir/apache.conf"; else : > "$dir/no-apache-conf"; fi
   if [[ -f "$APACHE_POLLING_CONF" ]]; then cp -a "$APACHE_POLLING_CONF" "$dir/apache-polling.conf"; else : > "$dir/no-apache-polling"; fi
   if [[ -f "$SERVICE_FILE" ]]; then cp -a "$SERVICE_FILE" "$dir/service"; else : > "$dir/no-service"; fi
-  if [[ -f "$TIMER_FILE" ]]; then cp -a "$TIMER_FILE" "$dir/timer"; else : > "$dir/no-timer"; fi
+  if [[ -f "$PATH_FILE" ]]; then cp -a "$PATH_FILE" "$dir/path"; else : > "$dir/no-path"; fi
+
+  # Preserve the old timer only as forensic backup evidence.
+  if [[ -f "$TIMER_FILE" ]]; then
+    cp -a "$TIMER_FILE" "$dir/legacy-timer"
+  else
+    : > "$dir/no-legacy-timer"
+  fi
   for relative in "${OBSOLETE_RELATIVE[@]}"; do
     if [[ -L "$APP_DIR/$relative" ]]; then
       fail "Unsafe legacy symlink found: $APP_DIR/$relative"
@@ -323,7 +401,8 @@ make_backup() {
   done
   [[ -L "/etc/apache2/conf-enabled/${APACHE_CONF_NAME}.conf" ]] && : > "$dir/apache-enabled"
   [[ -L "/etc/apache2/conf-enabled/${APACHE_POLLING_NAME}.conf" ]] && : > "$dir/apache-polling-enabled"
-  systemctl is-enabled --quiet asl3-node-audit.timer 2>/dev/null && : > "$dir/timer-enabled"
+  systemctl is-enabled --quiet asl3-node-audit.path 2>/dev/null && : > "$dir/path-enabled"
+  systemctl is-enabled --quiet asl3-node-audit.timer 2>/dev/null && : > "$dir/legacy-timer-was-enabled"
   chmod -R go-rwx "$dir"
   printf '%s' "$dir"
 }
@@ -333,9 +412,10 @@ if [[ "$ACTION" == "uninstall" ]]; then
   backup="$(make_backup)"
   tar --exclude='.git' -C /var/www/html -czf "$backup/application-before-uninstall.tar.gz" asl3_node_audit
   chmod 0600 "$backup/application-before-uninstall.tar.gz"
+  systemctl disable --now asl3-node-audit.path >/dev/null 2>&1 || true
   systemctl disable --now asl3-node-audit.timer >/dev/null 2>&1 || true
   systemctl stop asl3-node-audit.service >/dev/null 2>&1 || true
-  rm -f "$SERVICE_FILE" "$TIMER_FILE"
+  rm -f "$SERVICE_FILE" "$PATH_FILE" "$TIMER_FILE"
   systemctl daemon-reload
   a2disconf "$APACHE_CONF_NAME" >/dev/null 2>&1 || true
   a2disconf "$APACHE_POLLING_NAME" >/dev/null 2>&1 || true
@@ -353,10 +433,10 @@ fi
 for dir in public src bin; do
   [[ -d "$APP_DIR/$dir" && ! -L "$APP_DIR/$dir" ]] || fail "Missing or unsafe application directory: $APP_DIR/$dir"
 done
-for runtime in run run/web run/auth; do
+for runtime in run run/web run/auth run/trigger; do
   [[ ! -L "$APP_DIR/$runtime" ]] || fail "Unsafe runtime symlink: $APP_DIR/$runtime"
 done
-for managed in "$APACHE_CONF" "$APACHE_POLLING_CONF" "$SERVICE_FILE" "$TIMER_FILE"; do
+for managed in "$APACHE_CONF" "$APACHE_POLLING_CONF" "$SERVICE_FILE" "$PATH_FILE" "$TIMER_FILE"; do
   [[ ! -L "$managed" ]] || fail "Unsafe managed-file symlink: $managed"
 done
 [[ ! -L "$BACKUP_ROOT" ]] || fail "Unsafe backup-root symlink: $BACKUP_ROOT"
@@ -369,7 +449,7 @@ id "$WEB_USER" >/dev/null 2>&1 || fail "Web user does not exist: $WEB_USER"
 
 required_files=(
   VERSION README.md .gitignore config.ini.example setup_asl3_node_audit.sh
-  public/index.php public/login.php public/logout.php public/data.php public/live.php
+  public/index.php public/login.php public/logout.php public/data.php public/live.php public/refresh.php
   public/app.js public/security-live.js public/full-audit-live.js public/style.css
   src/auth.php src/node_identity.php src/apt_security.py src/monitor_engine.py
   bin/asl3-node-audit.sh bin/audit_monitor.py bin/security_monitor.py bin/monitor_runner.py bin/full_audit.py
@@ -402,8 +482,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Prevent the timer from starting a cycle while setup is changing permissions/files.
-systemctl stop asl3-node-audit.timer >/dev/null 2>&1 || true
+# Quiesce Node Audit's own scheduling while setup changes files.
+# v1.0.1's permanent timer is retired on every upgrade.
+systemctl disable --now asl3-node-audit.timer >/dev/null 2>&1 || true
+systemctl stop asl3-node-audit.path >/dev/null 2>&1 || true
+
 for _ in {1..60}; do
   systemctl is-active --quiet asl3-node-audit.service || break
   sleep 1
@@ -470,9 +553,12 @@ chmod 0640 "$CONFIG_FILE"
 install -d -o root -g "$WEB_GROUP" -m 0710 "$APP_DIR/run"
 install -d -o root -g "$WEB_GROUP" -m 2750 "$APP_DIR/run/web"
 install -d -o "$WEB_USER" -g "$WEB_GROUP" -m 0700 "$APP_DIR/run/auth"
+install -d -o "$WEB_USER" -g "$WEB_GROUP" -m 0700 "$APP_DIR/run/trigger"
+
 find "$APP_DIR/run" -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} + 2>/dev/null || true
 find "$APP_DIR/run/web" -maxdepth 1 -type f -exec chown root:"$WEB_GROUP" {} + -exec chmod 0640 {} + 2>/dev/null || true
 find "$APP_DIR/run/auth" -maxdepth 1 -type f -exec chown "$WEB_USER":"$WEB_GROUP" {} + -exec chmod 0600 {} + 2>/dev/null || true
+find "$APP_DIR/run/trigger" -maxdepth 1 -type f -exec chown "$WEB_USER":"$WEB_GROUP" {} + -exec chmod 0600 {} + 2>/dev/null || true
 
 apache_tmp="$(mktemp)"
 cat > "$apache_tmp" <<APACHE
@@ -500,10 +586,14 @@ cat > "$poll_tmp" <<'APACHE'
 # Managed by setup_asl3_node_audit.sh.
 # Marks only successful high-frequency Node Audit polling when the host's
 # existing CustomLog expression honors dontlog_app_polling_200.
-SetEnvIf Request_URI "^/asl3_node_audit/(live\.php|data\.php)$" dontlog_app_polling_200=1
+SetEnvIf Request_URI "^/asl3_node_audit/(live\.php|data\.php|refresh\.php)$" dontlog_app_polling_200=1
+SetEnvIfExpr "-R '127.0.0.1/32' && req('User-Agent') == 'ASL3-Node-Audit-SelfCheck/1'" dontlog_app_polling=1
 APACHE
 install -o root -g root -m 0644 "$poll_tmp" "$APACHE_POLLING_CONF"
 rm -f "$poll_tmp"
+
+ensure_shared_polling_hook
+
 a2enconf "$APACHE_CONF_NAME" >/dev/null
 a2enconf "$APACHE_POLLING_NAME" >/dev/null
 apache2ctl configtest >/dev/null || fail "Apache rejected the ASL3 Node Audit configuration."
@@ -533,22 +623,24 @@ EOF_SERVICE
 chmod 0644 "$SERVICE_FILE"
 chown root:root "$SERVICE_FILE"
 
-cat > "$TIMER_FILE" <<'EOF_TIMER'
+cat > "$PATH_FILE" <<EOF_PATH
 [Unit]
-Description=ASL3 Node Audit scheduled monitoring
+Description=ASL3 Node Audit browser-trigger watcher
 
-[Timer]
-OnBootSec=2min
-OnUnitInactiveSec=60s
-AccuracySec=10s
+[Path]
+PathChanged=$APP_DIR/run/trigger/request
 Unit=asl3-node-audit.service
-Persistent=false
 
 [Install]
-WantedBy=timers.target
-EOF_TIMER
-chmod 0644 "$TIMER_FILE"
-chown root:root "$TIMER_FILE"
+WantedBy=multi-user.target
+EOF_PATH
+chmod 0644 "$PATH_FILE"
+chown root:root "$PATH_FILE"
+
+# Permanently retire the v1.0.1 scheduled timer.
+systemctl disable --now asl3-node-audit.timer >/dev/null 2>&1 || true
+rm -f "$TIMER_FILE"
+
 systemctl daemon-reload
 
 # Permissions and read/write boundaries before the first monitor run.
@@ -565,12 +657,12 @@ echo "[OK] Initial Node Audit checks completed."
 result="$(systemctl show asl3-node-audit.service -p Result --value)"
 status="$(systemctl show asl3-node-audit.service -p ExecMainStatus --value)"
 [[ "$result" == "success" && "$status" == "0" ]] || fail "Initial monitor result was $result/$status"
-systemctl enable --now asl3-node-audit.timer >/dev/null
+systemctl enable --now asl3-node-audit.path >/dev/null
 
 # Local route checks. HTTP is preferred; HTTPS is a fallback. No hostname setting is required.
 curl_code() {
   local url="$1"; shift
-  curl -sS --noproxy '*' --connect-timeout 3 --max-time 8 "$@" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true
+  curl -sS --noproxy '*' --connect-timeout 3 --max-time 8 -A 'ASL3-Node-Audit-SelfCheck/1' "$@" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true
 }
 base=""
 for try in "http://127.0.0.1" "https://127.0.0.1"; do
@@ -595,7 +687,8 @@ ok "ASL3 Node Audit setup complete."
 echo "Version: $(tr -d '\r\n' < "$APP_DIR/VERSION")"
 if [[ "$node" =~ ^[0-9]{4,7}$ ]]; then echo "Local node: $node"; else echo "MYNODE was not detected unambiguously. Set it in $CONFIG_FILE and run setup again."; fi
 echo "Config: $CONFIG_FILE"
-echo "Timer: asl3-node-audit.timer"
+echo "Audit refresh: on open, then every 10 minutes while the dashboard remains open"
+echo "Legacy timer: REMOVED"
 echo "Protected setup backup: $backup"
 show_access_info
 show_auth_status

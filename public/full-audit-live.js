@@ -2,7 +2,7 @@
 // Dynamic structured full-audit data. Keeps the accepted 15-card dashboard layout.
 const $=s=>document.querySelector(s), all=s=>[...document.querySelectorAll(s)];
 const LEVELS=new Set(['PASS','WARN','FAIL','INFO','SKIP','UNKNOWN']);
-const MAX_AGE=15*60*1000;
+const MAX_AGE=null; // On-demand snapshots remain valid until the next refresh.
 let lastStamp=null, loading=false;
 const el=(tag,cls,txt)=>{const x=document.createElement(tag);if(cls)x.className=cls;if(txt!==undefined)x.textContent=txt;return x;};
 const time=ms=>Number.isFinite(ms)?new Date(ms).toLocaleString():'';
@@ -81,7 +81,7 @@ function findings(items){
 }
 function render(d){
  const stamp=Date.parse(d.checked_at_utc||'');const age=Date.now()-stamp;
- if(d.schema!==1||d.kind!=='full_audit'||!Number.isFinite(stamp)||age< -60000||age>MAX_AGE
+ if(d.schema!==1||d.kind!=='full_audit'||!Number.isFinite(stamp)||age< -60000
     || !Array.isArray(d.sections)||d.sections.length!==15||d.status!=='CURRENT'){
    status('Overdue — new check required','bad');counters(null);return;
  }
@@ -103,11 +103,11 @@ function render(d){
 async function poll(){if(document.hidden||loading)return;loading=true;
  try{const res=await fetch('data.php?feed=full',{cache:'no-store',credentials:'same-origin',headers:{Accept:'application/json'}});
    if(!res.ok)throw Error('Audit HTTP '+res.status);render(await res.json());
- }catch{status('Checking / temporarily unavailable','bad');counters(null)}finally{loading=false;}
+ }catch{status('Full audit unavailable — refresh failed','bad');counters(null)}finally{loading=false;}
 }
 function start(){
  // Avoid presenting the old report's counts/timestamp before the first updated feed.
- status('Checking…');counters(null);findings([]);
+ status('Stand by — gathering current audit information…');counters(null);findings([]);
  all('.tile-sub').forEach(x=>x.textContent='Checking…');
  all('.tile-badge').forEach(x=>x.textContent='…');
  poll();setInterval(poll,30000);

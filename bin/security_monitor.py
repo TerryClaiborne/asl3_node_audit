@@ -93,6 +93,7 @@ def lan_ip():
 
 def _curl_code(url):
     args=['curl','-sS','--noproxy','*','--connect-timeout','3','--max-time','8',
+          '-A','ASL3-Node-Audit-SelfCheck/1',
           '-o','/dev/null','-w','%{http_code}']
     if url.startswith('https://'):
         args.append('-k')

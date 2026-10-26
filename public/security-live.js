@@ -6,10 +6,13 @@ function replaceChildren(el,children){if(el)el.replaceChildren(...children)}
 function render(d){
  const viewOnly=document.body?.dataset.viewOnly==='1';
  const date=typeof d.checked_at_utc==='string'?Date.parse(d.checked_at_utc):NaN;
- const fresh=d.state==='CURRENT'&&Number.isFinite(date)&&Math.abs(Date.now()-date)<150000;
+ const fresh=d.state==='CURRENT'&&Number.isFinite(date);
+ const unavailable=d.state==='UNAVAILABLE';
  const checked=fresh&&d.apt_state==='CHECKED'&&Number.isInteger(d.security_count);
  const pending=checked?d.security_count:null;
- const stateText=!fresh?'Checking / unavailable':!checked?'Security updates unverified':pending?'Security updates pending':'No pending security upgrades';
+ const stateText=fresh
+   ?(!checked?'Security updates unverified':pending?'Security updates pending':'No pending security upgrades')
+   :(unavailable?'Security check unavailable':'Stand by — gathering current security information…');
  const badge=$('.security-inline');
  if(badge){badge.textContent=checked?`Debian security: ${pending} pending`:stateText;badge.classList.toggle('security-unverified',!checked)}
  const findings=$('#findings-body');
@@ -19,8 +22,8 @@ function render(d){
    if(!needed){item?.remove()}else{
      if(!item){item=row('button','finding');item.type='button';findings.prepend(item)}
      item.dataset.auditSecurity='1';item.dataset.openSection='2';
-     replaceChildren(item,[row('span',`tag ${checked?'warn':'unknown'}`,checked?'WARN':'CHECKING'),
-       row('span','',checked?`${pending} Debian security package updates pending`: 'Security check in progress or unavailable'),
+     replaceChildren(item,[row('span',`tag ${checked?'warn':'unknown'}`,checked?'WARN':unavailable?'UNKNOWN':'CHECKING'),
+       row('span','',checked?`${pending} Debian security package updates pending`: unavailable?'Security check unavailable':'Stand by — gathering current security information…'),
        row('span','arrow',viewOnly?'Login to view details':'View updates ↗')]);
      item.disabled=viewOnly;
      item.onclick=viewOnly?null:()=>$('#tilegrid .tile[data-section="2"]')?.click();
@@ -31,7 +34,7 @@ function render(d){
  const panel=$('#detail-2 .security-details');
  if(panel){
    const contents=[row('strong','', 'Current Debian security updates'),row('div','security-meta',
-     fresh?`Security checked: ${new Date(date).toLocaleString()} · Partial audit coverage`:'A current security check is not available yet')];
+     fresh?`Security checked: ${new Date(date).toLocaleString()} · Partial audit coverage`:unavailable?'Security check unavailable':'Stand by — gathering current security information…')];
    if(checked){
      contents.push(row('div','security-meta',`${pending} security updates; ${d.other_count??'?'} other upgrades`));
      if(Array.isArray(d.security_packages)&&pending){
@@ -40,7 +43,7 @@ function render(d){
        for(const p of d.security_packages){const r=row('tr');for(const k of ['package','installed','candidate'])r.append(row('td','',String(p[k]??'')));body.append(r)}
        table.append(head,body);contents.push(table);
      }
-   }else contents.push(row('div','security-meta','Automatic monitoring will retry. No clean status is assumed.'));
+   }else contents.push(row('div','security-meta',unavailable?'Security check could not be completed. No clean status is assumed.':'Stand by — gathering current security information…'));
    replaceChildren(panel,contents);
  }
  // Keep security alarm separate from ordinary pending package updates.
