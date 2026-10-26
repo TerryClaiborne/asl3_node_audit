@@ -183,8 +183,13 @@ if [[ -r /var/lib/asterisk/astdb.txt ]]; then report INFO 'Local Asterisk identi
 if have ss; then
   TCPSOCKETS=$(runquick ss -H -l -t -n || true)
   UDPSOCKETS=$(runquick ss -H -l -u -n || true)
-  if listen_udp 4569; then report PASS 'IAX2 UDP/4569 is locally listening.'
-  else report WARN 'No UDP/4569 listener found (verify this node needs IAX2).' 'Check: sudo ss -lunp'; fi
+  IAX_PORT=4569
+  if [[ -r /etc/asterisk/iax.conf ]]; then
+    IAX_CONFIG_PORT=$(awk -F= '/^[[:space:]]*bindport[[:space:]]*=/ {v=$2; sub(/[;#].*$/, "", v); gsub(/[[:space:]]/, "", v); if (v ~ /^[0-9]+$/) port=v} END {if (port != "") print port}' /etc/asterisk/iax.conf)
+    if [[ "$IAX_CONFIG_PORT" =~ ^[0-9]+$ ]] && (( IAX_CONFIG_PORT >= 1 && IAX_CONFIG_PORT <= 65535 )); then IAX_PORT="$IAX_CONFIG_PORT"; fi
+  fi
+  if listen_udp "$IAX_PORT"; then report PASS "IAX2 UDP/$IAX_PORT is locally listening."
+  else report WARN "No UDP/$IAX_PORT listener found (verify this node needs IAX2)." 'Check: sudo ss -lunp'; fi
   if listen_tcp 5038; then
     if bind_any_tcp 5038; then report WARN 'AMI TCP/5038 bound to all interfaces; assess trusted hosts and router/firewall forwarding.'
     else report PASS 'AMI TCP/5038 is not bound to all interfaces.'; fi
