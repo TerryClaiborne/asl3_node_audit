@@ -12,11 +12,12 @@ SUMMARY_FIRST=0
 TIMEOUT_SECS=5
 for a in "$@"; do
   case "$a" in
+    --full) ;; # Explicit full-audit mode; full audit is also the default.
     --no-color) NO_COLOR=1 ;;
     --internal-render) INTERNAL_RENDER=1 ;;
     --summary-first) SUMMARY_FIRST=1 ;;
     --version) echo "ASL3 Node Audit $VERSION"; exit 0 ;;
-    -h|--help) printf 'Usage: sudo bash %s [--no-color] [--summary-first]\nRead-only. No apt-get update or service changes.\n' "$0"; exit 0 ;;
+    -h|--help) printf 'Usage: sudo bash %s [--full] [--no-color] [--summary-first]\n  --full           Run the complete read-only 15-section audit (also the default).\n  --no-color       Disable ANSI colors for logs/copy-paste.\n  --summary-first  Show priority findings before the complete report.\n  --version        Print the installed audit version.\nRead-only. No apt-get update or service changes.\n' "$0"; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$a" >&2; exit 2 ;;
   esac
 done
@@ -80,7 +81,12 @@ service_status() {
   state=$(systemctl is-active "$svc" 2>/dev/null || true)
   case "$state" in
     active) report PASS "$desc: active." ;;
-    failed) report FAIL "$desc: FAILED." "Inspect: systemctl status $svc --no-pager" ;;
+    failed)
+      if [[ "$expected" == required ]]; then
+        report FAIL "$desc: FAILED (required for normal node operation)." "Inspect: systemctl status $svc --no-pager"
+      else
+        report WARN "$desc: failed (optional or role-dependent service)." "Inspect: systemctl status $svc --no-pager"
+      fi ;;
     inactive)
       if [[ "$expected" == required ]]; then
         report WARN "$desc: inactive (required for normal node operation)." "Check: systemctl status $svc --no-pager"
@@ -138,7 +144,7 @@ fi
 section '2. Updates and package integrity'
 if have apt; then
   APTLIST=$(apt list --upgradable 2>/dev/null | awk 'NR>1 && /\[upgradable from:/ {++n} END {print n+0}')
-  if ((APTLIST>0)); then report WARN "$APTLIST package(s) show available updates (cached APT data)." 'To refresh: sudo apt update | To list packages: apt list --upgradable | To simulate only: sudo apt-get -s upgrade | To install when ready: sudo apt upgrade'
+  if ((APTLIST>0)); then report INFO "$APTLIST package(s) show available updates in cached APT data; security classification is reported separately by the security monitor." 'To refresh: sudo apt update | To list packages: apt list --upgradable | To simulate only: sudo apt-get -s upgrade | To install when ready: sudo apt upgrade'
   else report INFO 'No upgrades shown in locally cached apt lists; they may be stale.'; fi
   LISTDATE=$(find /var/lib/apt/lists -maxdepth 1 -type f -name '*InRelease' -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
   if [[ "$LISTDATE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -174,10 +180,13 @@ if have asterisk; then
   fi
 else report FAIL 'Asterisk executable not found.'; fi
 if [[ -f /etc/asterisk/rpt.conf ]]; then report PASS 'rpt.conf exists.'; else report WARN 'rpt.conf not found at expected path.'; fi
+MANAGER_MODE=
 if [[ -f /etc/asterisk/manager.conf ]]; then
-  report INFO 'manager.conf exists; AMI access restrictions and permissions should be reviewed.'
-  MODE=$(stat -c %a /etc/asterisk/manager.conf 2>/dev/null || true)
-  if [[ "$MODE" =~ ^[0-9]+$ ]] && (( (8#$MODE & 8#004) != 0 )); then report WARN 'manager.conf appears world-readable.' 'Review file permissions without disrupting Asterisk.'; fi
+  report INFO 'manager.conf exists; credentials are not displayed.'
+  MANAGER_MODE=$(stat -c %a /etc/asterisk/manager.conf 2>/dev/null || true)
+  if [[ "$MANAGER_MODE" =~ ^[0-9]+$ ]] && (( (8#$MANAGER_MODE & 8#022) != 0 )); then
+    report WARN "manager.conf mode $MANAGER_MODE permits group/other write access." 'Review ownership and write permissions carefully without disrupting Asterisk.'
+  fi
 fi
 if [[ -r /var/lib/asterisk/astdb.txt ]]; then report INFO 'Local Asterisk identity database found (contents not printed).'; fi
 if have ss; then
@@ -191,10 +200,29 @@ if have ss; then
   if listen_udp "$IAX_PORT"; then report PASS "IAX2 UDP/$IAX_PORT is locally listening."
   else report WARN "No UDP/$IAX_PORT listener found (verify this node needs IAX2)." 'Check: sudo ss -lunp'; fi
   if listen_tcp 5038; then
-    if bind_any_tcp 5038; then report WARN 'AMI TCP/5038 bound to all interfaces; assess trusted hosts and router/firewall forwarding.'
-    else report PASS 'AMI TCP/5038 is not bound to all interfaces.'; fi
+    if bind_any_tcp 5038; then
+      report WARN 'AMI TCP/5038 bound to all interfaces; assess trusted hosts and router/firewall forwarding.'
+    else
+      report PASS 'AMI TCP/5038 is not bound to all interfaces.'
+    fi
   else report INFO 'No AMI TCP/5038 listener observed.'; fi
-else TCPSOCKETS=; UDPSOCKETS=; report UNKNOWN 'ss not available; listener checks skipped.'; fi
+  if [[ "$MANAGER_MODE" =~ ^[0-9]+$ ]] && (( (8#$MANAGER_MODE & 8#004) != 0 )); then
+    if listen_tcp 5038 && bind_any_tcp 5038; then
+      report WARN "manager.conf mode $MANAGER_MODE permits local-user read access while AMI is wildcard-bound." 'The file permission is local filesystem exposure; separately restrict AMI network access and review permissions without blindly chmodding the file.'
+    else
+      report INFO "manager.conf mode $MANAGER_MODE permits local-user read access; this is local filesystem access, not direct LAN/Internet exposure."
+    fi
+  elif [[ "$MANAGER_MODE" =~ ^[0-9]+$ ]]; then
+    report PASS "manager.conf mode $MANAGER_MODE does not permit other-user read access."
+  elif [[ -f /etc/asterisk/manager.conf ]]; then
+    report UNKNOWN 'manager.conf permissions could not be interpreted.'
+  fi
+else
+  TCPSOCKETS=; UDPSOCKETS=; report UNKNOWN 'ss not available; listener checks skipped.'
+  if [[ "$MANAGER_MODE" =~ ^[0-9]+$ ]] && (( (8#$MANAGER_MODE & 8#004) != 0 )); then
+    report INFO "manager.conf mode $MANAGER_MODE permits local-user read access; network AMI exposure could not be checked because ss is unavailable."
+  fi
+fi
 if have systemctl; then
   FAILEDUNITS=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '$1 ~ /\.(service|socket|timer|mount)$/ {++n} END{print n+0}')
   if ((FAILEDUNITS>0)); then report WARN "$FAILEDUNITS failed systemd unit(s) detected." 'To inspect: systemctl --failed --no-pager'
@@ -291,7 +319,13 @@ fi
 if have sshd; then
   SSHD=$(runquick sshd -T || true)
   if [[ -n "$SSHD" ]]; then
-    if grep -Eiq '^permitemptypasswords yes' <<< "$SSHD"; then report FAIL 'SSH permits empty passwords in effective configuration.'; else report PASS 'SSH does not report empty passwords enabled.'; fi
+    if grep -Eiq '^permitemptypasswords yes' <<< "$SSHD"; then
+      report FAIL 'SSH permits empty passwords in effective configuration.'
+    elif grep -Eiq '^permitemptypasswords no' <<< "$SSHD"; then
+      report PASS 'SSH explicitly disallows empty passwords.'
+    else
+      report UNKNOWN 'Effective SSH empty-password setting could not be established.'
+    fi
     if grep -Eiq '^permitrootlogin yes' <<< "$SSHD"; then report WARN 'SSH permits root login; check effective authentication methods.'; fi
     if grep -Eiq '^passwordauthentication yes' <<< "$SSHD"; then report INFO 'SSH password authentication enabled; consider keys and access controls.'; fi
   else report UNKNOWN 'Unable to parse effective sshd configuration.'; fi
@@ -325,7 +359,14 @@ if have vcgencmd; then
   THROTTLE=$(runquick vcgencmd get_throttled || true)
   if [[ "$THROTTLE" =~ 0x([[:xdigit:]]+) ]]; then
     VALUE=$((16#${BASH_REMATCH[1]}))
-    if ((VALUE!=0)); then report WARN 'Raspberry Pi reports present or historical undervoltage/throttling flags.' 'Inspect: vcgencmd get_throttled (history flags can persist until reboot).'
+    CURRENT_MASK=$((VALUE & 0xF))
+    HISTORY_MASK=$((VALUE & 0xF0000))
+    if ((CURRENT_MASK!=0)); then
+      report WARN "Raspberry Pi reports current undervoltage/throttling flags (get_throttled=$THROTTLE)." 'Inspect: vcgencmd get_throttled; current-condition bits are in the low nibble.'
+    elif ((HISTORY_MASK!=0)); then
+      report INFO "Raspberry Pi reports historical-only undervoltage/throttling flags (get_throttled=$THROTTLE); no current condition bit is set."
+    elif ((VALUE!=0)); then
+      report INFO "Raspberry Pi reports nonzero throttle flags outside the recognized current/history masks (get_throttled=$THROTTLE)."
     else report PASS 'No Pi throttling/undervoltage flags reported.'; fi
   else report UNKNOWN 'Pi throttle flags unavailable.'; fi
 fi
@@ -348,8 +389,10 @@ if service_active asterisk.service && have asterisk; then
           if [[ "$count" =~ ^[0-9]+$ ]]; then report INFO "Asterisk active channels: $count (snapshot only)."
           else report INFO 'Asterisk channel-count command responds.'; fi ;;
         'iax2 show registry')
-          if grep -Eiq 'Rejected|Unregistered|Request Sent|Timeout' <<< "$out"; then
-            report WARN 'IAX2 registry output includes an unsuccessful or pending registration.' 'Inspect: sudo asterisk -rx "iax2 show registry"'
+          if grep -Eiq 'Rejected|Unregistered|Timeout' <<< "$out"; then
+            report WARN 'IAX2 registry output includes an unsuccessful registration state.' 'Inspect: sudo asterisk -rx "iax2 show registry"'
+          elif grep -Eiq 'Request Sent' <<< "$out"; then
+            report INFO 'IAX2 registry includes a pending Request Sent state; recheck if it persists.'
           else report INFO 'IAX2 registry command responds (review registration details privately).'; fi ;;
         *) report INFO 'App_rpt variables command responds; individual radio functions not tested.' ;;
       esac
@@ -361,8 +404,12 @@ if [[ -d /etc/asterisk ]]; then
     if [[ -f "/etc/asterisk/$cfg" ]]; then report INFO "Asterisk configuration present: $cfg (contents not displayed)."
     else report INFO "Asterisk configuration absent: $cfg (may be generated/included or optional)."; fi
   done
-  if find /etc/asterisk -maxdepth 1 -type f \( -name '*.dpkg-dist' -o -name '*.dpkg-old' -o -name '*.ucf-dist' \) -print -quit 2>/dev/null | grep -q .; then
-    report WARN 'Asterisk directory has package-merge leftover files (.dpkg-dist/.dpkg-old).' 'Compare carefully against live configuration; do not overwrite automatically.'
+  if find /etc/asterisk -maxdepth 1 -type f \( -name '*.dpkg-dist' -o -name '*.ucf-dist' \) -print -quit 2>/dev/null | grep -q .; then
+    report WARN 'Asterisk directory has package-supplied configuration candidates (.dpkg-dist/.ucf-dist).' 'Compare carefully against live configuration; do not overwrite automatically.'
+  fi
+  DPKG_OLD_COUNT=$(find /etc/asterisk -maxdepth 1 -type f -name '*.dpkg-old' 2>/dev/null | wc -l)
+  if ((DPKG_OLD_COUNT>0)); then
+    report INFO "$DPKG_OLD_COUNT saved .dpkg-old Asterisk configuration file(s) found; these are backups, not unresolved merge candidates by themselves."
   fi
 fi
 for svc in analog_bridge mmdvm_bridge ircddbgateway ysfgateway p25gateway nxdngateway; do
@@ -371,7 +418,7 @@ for svc in analog_bridge mmdvm_bridge ircddbgateway ysfgateway p25gateway nxdnga
     [[ "$en" == enabled ]] && ! service_active "$svc.service" && report WARN "$svc enabled at boot but not active." 'Verify whether this bridge is actually configured for use.'
   fi
 done
-for port in 4569 5038 8080 8443 9090; do
+for port in 5038 8080 8443 9090; do
   if listen_tcp "$port"; then report INFO "TCP/$port listening locally (not proof of external reachability)."; fi
 done
 
@@ -398,8 +445,8 @@ if service_active apache2.service; then
 fi
 if have certbot; then
   report INFO 'Certbot installed; certificate expiry checks require careful parsing of locally configured certificates.'
+  certcount=0; soon=0; expired=0
   if [[ -d /etc/letsencrypt/live ]]; then
-    certcount=0; soon=0; expired=0
     while IFS= read -r -d '' cert; do
       ((certcount+=1))
       if have openssl; then
@@ -412,12 +459,20 @@ if have certbot; then
     elif ((certcount>0)); then report PASS "$certcount local Let's Encrypt certificate(s) valid beyond 14 days."
     else report INFO 'No readable cert.pem under the standard Let’s Encrypt live directory.'; fi
   fi
+  renewal_seen=0; renewal_active=0
   for unit in certbot.timer snap.certbot.renew.timer; do
     if service_exists "$unit"; then
-      if service_active "$unit"; then report PASS "Certificate renewal timer $unit active."
-      else report WARN "Certificate renewal timer $unit inactive." 'Verify whether renewal is handled by a different mechanism.'; fi
+      ((renewal_seen+=1))
+      if service_active "$unit"; then
+        ((renewal_active+=1)); report PASS "Certificate renewal timer $unit active."
+      else
+        report INFO "Certificate renewal timer $unit exists but is inactive; another renewal mechanism may be in use."
+      fi
     fi
   done
+  if ((renewal_seen>0 && renewal_active==0 && certcount>0)); then
+    report WARN 'No recognized Certbot renewal timer is active for locally detected Let’s Encrypt certificates.' 'Verify the actual renewal mechanism before making changes.'
+  fi
 fi
 printf '    %-22s %-12s %s\n' 'Dashboard' 'Version' 'Git tracked files'
 for app in alltune2 allstar_connect allstar_view dvswitch_cockpit allscan; do
@@ -464,8 +519,8 @@ if service_active fail2ban.service && have fail2ban-client; then
     report INFO "Fail2Ban configured jail count: ${#jailarr[@]} (names withheld)."
   fi
   if have journalctl; then
-    if journalctl -u fail2ban -n 100 --no-pager 2>/dev/null | grep -Eiq '(ERROR|CRITICAL|Failed to start)'; then
-      report WARN 'Recent Fail2Ban journal lines contain error keywords.' 'Inspect: sudo journalctl -u fail2ban -n 100 --no-pager'
+    if journalctl -u fail2ban --since '1 hour ago' --no-pager 2>/dev/null | grep -Eiq '(ERROR|CRITICAL|Failed to start)'; then
+      report WARN 'Fail2Ban journal entries from the last hour contain error keywords.' 'Inspect: sudo journalctl -u fail2ban --since "1 hour ago" --no-pager'
     fi
   fi
 fi
@@ -524,7 +579,7 @@ if have df; then
 fi
 if [[ -d /var/log ]]; then
   large_count=$(find /var/log -xdev -type f -size +100M 2>/dev/null | wc -l)
-  if ((large_count>0)); then report WARN "$large_count log file(s) larger than 100 MiB in /var/log." 'Inspect sizes; do not delete logs without knowing rotation and retention requirements.'
+  if ((large_count>0)); then report INFO "$large_count log file(s) larger than 100 MiB in /var/log; size alone is not a fault." 'Inspect rotation/retention if disk usage is also elevated; do not delete logs blindly.'
   else report PASS 'No log files above 100 MiB in the /var/log tree.'; fi
 fi
 if [[ -e /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]]; then
@@ -578,7 +633,7 @@ if have systemctl; then
   failed_units=$(runquick systemctl list-units --type=service --state=failed --no-legend --plain --no-pager || true)
   failed_count=$(printf '%s\n' "$failed_units" | awk '$1 ~ /\.service$/ {n++} END {print n+0}')
   if ((failed_count>0)); then
-    report FAIL "$failed_count failed system service(s)." 'To inspect: systemctl --failed --type=service --no-pager'
+    report WARN "$failed_count failed system service(s) in the general inventory; required services are evaluated separately." 'To inspect: systemctl --failed --type=service --no-pager'
     printf '%s\n' "$failed_units" | awk '$1 ~ /\.service$/ {print "      " $1}'
   else
     report PASS 'No failed system services in systemd inventory.'
@@ -755,13 +810,13 @@ if have ps; then
     report INFO 'No obvious mining-tool process names among visible processes; hidden or renamed miners are not ruled out.'
   fi
   high=$(ps -eo pid=,comm=,pcpu= --sort=-pcpu 2>/dev/null | awk '$3+0 >= 85 {print $1":"$2"("$3"%)"}' | head -n 5 | paste -sd ', ' -)
-  if [[ -n "$high" ]]; then report WARN "Very high CPU processes observed: $high (can be legitimate)." 'Inspect: ps -eo pid,comm,pcpu,pmem --sort=-pcpu | head -n 20'; fi
+  if [[ -n "$high" ]]; then report INFO "Very high CPU processes observed in this snapshot: $high; high CPU alone is not evidence of mining." 'Inspect: ps -eo pid,comm,pcpu,pmem --sort=-pcpu | head -n 20'; fi
 else report UNKNOWN 'ps unavailable; cannot examine running processes.'; fi
 if have ss; then
   # Port numbers are weak indicators. No remote addresses or URLs are included.
   mining_ports=$(runquick ss -Hnt state established 2>/dev/null | awk '{print $5}' | sed -nE 's/.*:([0-9]+)$/\1/p' | grep -E '^(3333|4444|5555|7777|14444|14433)$' | sort -u | paste -sd ',' - || true)
   if [[ -n "$mining_ports" ]]; then
-    report WARN "Established outbound TCP connections use commonly seen mining-pool ports: $mining_ports (not conclusive)." 'Inspect locally: sudo ss -ntp state established'
+    report INFO "Established outbound TCP connections use ports also seen with mining pools: $mining_ports; port number alone is not evidence of mining." 'Inspect locally: sudo ss -ntp state established'
   else
     report INFO 'No established connections on sampled common mining-pool TCP ports; other ports/protocols remain possible.'
   fi

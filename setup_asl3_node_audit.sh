@@ -687,7 +687,7 @@ ok "ASL3 Node Audit setup complete."
 echo "Version: $(tr -d '\r\n' < "$APP_DIR/VERSION")"
 if [[ "$node" =~ ^[0-9]{4,7}$ ]]; then echo "Local node: $node"; else echo "MYNODE was not detected unambiguously. Set it in $CONFIG_FILE and run setup again."; fi
 echo "Config: $CONFIG_FILE"
-echo "Audit refresh: on open, then every 10 minutes while the dashboard remains open"
+echo "Audit refresh: on open, then every 5 minutes while the dashboard remains open"
 echo "Legacy timer: REMOVED"
 echo "Protected setup backup: $backup"
 show_access_info

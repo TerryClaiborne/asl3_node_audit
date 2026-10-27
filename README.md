@@ -12,7 +12,7 @@ It is a diagnostic tool. It does not automatically repair configuration, install
 - Automatic local node detection from ASL3/Asterisk configuration.
 - Dark and light display modes.
 - Optional application login with a password-only login screen.
-- A scheduled systemd monitor; no manual audit command is required for normal dashboard use.
+- Browser-triggered full audits: immediately when the dashboard opens, then bounded by the server-side audit interval while the dashboard remains open. A manual command-line audit is also available.
 - A version-aware header star. When a newer GitHub release is available, the star lights and pulses; hover shows the installed and available versions.
 
 ## Screenshots
@@ -27,7 +27,7 @@ It is a diagnostic tool. It does not automatically repair configuration, install
 
 ## Tested platform
 
-Version 1.0.1 has been tested and is working on **AllStarLink 3 (ASL3) running Debian 13 (Trixie)**. It may also work on other ASL3/Debian releases, but those releases have not been verified for this version.
+ASL3 Node Audit has been tested and is working on **AllStarLink 3 (ASL3) running Debian 13 (Trixie)**. It may also work on other ASL3/Debian releases, but those releases have not been verified for this version.
 
 ## Requirements
 
@@ -181,6 +181,20 @@ Uninstall disables/removes only ASL3 Node Audit's systemd units and Apache confi
 - `src/` - private PHP/Python application source.
 - `bin/` - audit and scheduled-monitor programs.
 - `run/` - generated private runtime state; never commit this directory.
+
+## Dashboard refresh
+
+Opening the dashboard starts a full audit immediately. While the page remains open, it refreshes every 5 minutes. Closing the page stops browser-triggered audits.
+
+## Command-line audit
+
+Run the same complete read-only audit from a terminal:
+
+```bash
+sudo bash /var/www/html/asl3_node_audit/bin/asl3-node-audit.sh --full --no-color
+```
+
+Other options: `--summary-first`, `--version`, and `--help`.
 
 ## Troubleshooting
 

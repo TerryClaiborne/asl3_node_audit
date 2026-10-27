@@ -55,12 +55,37 @@ service('asterisk.service', 'Asterisk service')
 manager = Path('/etc/asterisk/manager.conf')
 try:
     mode = stat.S_IMODE(manager.stat().st_mode)
-    if mode & stat.S_IROTH:
+    rc, sockets = run('ss', '-H', '-l', '-t', '-n')
+    ami_listening = False
+    ami_wildcard = False
+    if rc == 0:
+        for line in sockets.splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            local = fields[3]
+            if local.endswith(':5038'):
+                ami_listening = True
+                if local.startswith('0.0.0.0:') or local.startswith('*:') or local.startswith('[::]:'):
+                    ami_wildcard = True
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
         add('asterisk.manager.perms', 'Asterisk manager.conf permissions', 'WARN',
-            'File is world-readable; review permissions before changing anything.')
+            f'Mode {mode:04o} permits group/other write access; review ownership and write permissions carefully.')
+    elif mode & stat.S_IROTH:
+        if ami_wildcard:
+            add('asterisk.manager.perms', 'Asterisk manager.conf permissions', 'WARN',
+                f'Mode {mode:04o} permits local-user read access and AMI is wildcard-bound. File readability is local filesystem exposure; assess AMI network exposure separately.')
+        elif rc == 0:
+            detail = (f'Mode {mode:04o} permits local-user read access. ' +
+                      ('AMI is listening but not wildcard-bound.' if ami_listening else 'No AMI TCP/5038 listener was observed.') +
+                      ' This is not direct LAN/Internet exposure by itself.')
+            add('asterisk.manager.perms', 'Asterisk manager.conf permissions', 'INFO', detail)
+        else:
+            add('asterisk.manager.perms', 'Asterisk manager.conf permissions', 'INFO',
+                f'Mode {mode:04o} permits local-user read access; AMI network exposure could not be checked.')
     else:
         add('asterisk.manager.perms', 'Asterisk manager.conf permissions', 'PASS',
-            'Not world-readable.')
+            f'Mode {mode:04o} does not permit other-user read access.')
 except OSError:
     add('asterisk.manager.perms', 'Asterisk manager.conf permissions', 'UNKNOWN',
         'Could not inspect file permissions.')

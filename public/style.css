@@ -147,3 +147,5 @@ body{background:var(--bg)}
 .auth-card{margin:0 auto}.auth-card h1{font-size:1.4rem;margin:0 0 .8rem}
 
 body[data-view-only="1"] .tile:disabled,body[data-view-only="1"] .finding:disabled,body[data-view-only="1"] #toggle-findings:disabled{cursor:default;opacity:1}body[data-view-only="1"] .tile:disabled:hover{background:var(--tile);border-color:var(--line)}body[data-view-only="1"] #search:disabled{cursor:not-allowed;opacity:.65}
+
+.mast-date.audit-running strong{color:var(--bad);font-weight:850}.mast-date.audit-error strong{color:var(--bad);font-weight:850}

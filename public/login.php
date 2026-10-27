@@ -26,4 +26,8 @@ $_SESSION['created']=time();
 $_SESSION['last']=time();
 $_SESSION['v']=hash('sha256',$cfg['password_hash']);
 $_SESSION['csrf']=bin2hex(random_bytes(32));
+// A successful login must begin with a fresh audit, even if another browser
+// requested one within the ordinary five-minute gate.  refresh.php consumes
+// this flag exactly once after the trigger is successfully queued.
+$_SESSION['force_audit_once']=true;
 header('Location: ./',true,303);

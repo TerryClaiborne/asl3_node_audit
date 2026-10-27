@@ -34,8 +34,13 @@ if (!audit_csrf_valid()) {
     exit;
 }
 
+$forceRequested = isset($_POST['force']) && $_POST['force'] === '1';
+$forceAllowed = $forceRequested && $cfg !== [] && audit_app_identity() !== null
+    && !empty($_SESSION['force_audit_once']);
+
 $dir = dirname(__DIR__) . '/run/trigger';
 $file = $dir . '/request';
+$lockFile = $dir . '/request.lock';
 
 if (is_link($dir) || !is_dir($dir) || !is_writable($dir)) {
     http_response_code(503);
@@ -44,40 +49,43 @@ if (is_link($dir) || !is_dir($dir) || !is_writable($dir)) {
 }
 
 clearstatcache(true, $file);
-if (is_link($file)) {
+clearstatcache(true, $lockFile);
+if (is_link($file) || is_link($lockFile)) {
     http_response_code(503);
     echo json_encode(['ok'=>false,'message'=>'Unsafe trigger state'], JSON_THROW_ON_ERROR);
     exit;
 }
 
-$handle = @fopen($file, 'c+');
-if ($handle === false) {
+/*
+ * Lock a separate file so a duplicate browser request never opens
+ * the systemd-watched request file for writing.  The watched file is touched
+ * only when the 300-second gate actually accepts a new full audit request.
+ */
+$lock = @fopen($lockFile, 'c+');
+if ($lock === false) {
     http_response_code(503);
-    echo json_encode(['ok'=>false,'message'=>'Could not request audit'], JSON_THROW_ON_ERROR);
+    echo json_encode(['ok'=>false,'message'=>'Could not lock audit request'], JSON_THROW_ON_ERROR);
     exit;
 }
 
 try {
-    if (!flock($handle, LOCK_EX)) {
-        throw new RuntimeException('Could not lock audit trigger');
+    if (!flock($lock, LOCK_EX)) {
+        throw new RuntimeException('Could not lock audit request');
     }
 
-    /*
-     * Store the last request time in the file itself. An empty newly-created
-     * file is never mistaken for an earlier audit request.
-     */
-    if (!rewind($handle)) {
-        throw new RuntimeException('Could not read audit trigger');
+    clearstatcache(true, $file);
+    if (is_link($file)) {
+        throw new RuntimeException('Unsafe trigger state');
     }
 
-    $previous = stream_get_contents($handle, 64);
+    $previous = @file_get_contents($file, false, null, 0, 64);
     $last = is_string($previous) && preg_match('/^[0-9]{1,20}$/', trim($previous))
         ? (int)trim($previous)
         : 0;
 
-    if ($last > 0 && (time() - $last) < 600) {
-        flock($handle, LOCK_UN);
-        fclose($handle);
+    if (!$forceAllowed && $last > 0 && (time() - $last) < 300) {
+        flock($lock, LOCK_UN);
+        fclose($lock);
         echo json_encode(
             ['ok'=>true,'queued'=>false,'message'=>'Recent audit already requested'],
             JSON_THROW_ON_ERROR
@@ -85,21 +93,35 @@ try {
         exit;
     }
 
-    if (!ftruncate($handle, 0) || !rewind($handle)
-        || fwrite($handle, (string)time() . "\n") === false
-        || !fflush($handle)) {
-        throw new RuntimeException('Could not write audit trigger');
+    $queuedAt = time();
+    $handle = @fopen($file, 'c+');
+    if ($handle === false) {
+        throw new RuntimeException('Could not request audit');
     }
 
-    @chmod($file, 0600);
-    flock($handle, LOCK_UN);
+    try {
+        if (!ftruncate($handle, 0) || !rewind($handle)
+            || fwrite($handle, (string)$queuedAt . "\n") === false
+            || !fflush($handle)) {
+            throw new RuntimeException('Could not write audit trigger');
+        }
+        @chmod($file, 0600);
+    } finally {
+        fclose($handle);
+    }
+
+    if ($forceAllowed) {
+        unset($_SESSION['force_audit_once']);
+    }
+    @chmod($lockFile, 0600);
+    flock($lock, LOCK_UN);
 } catch (Throwable $e) {
-    @flock($handle, LOCK_UN);
-    fclose($handle);
+    @flock($lock, LOCK_UN);
+    fclose($lock);
     http_response_code(503);
     echo json_encode(['ok'=>false,'message'=>'Could not request audit'], JSON_THROW_ON_ERROR);
     exit;
 }
 
-fclose($handle);
-echo json_encode(['ok'=>true,'queued'=>true], JSON_THROW_ON_ERROR);
+fclose($lock);
+echo json_encode(['ok'=>true,'queued'=>true,'queued_at_ms'=>$queuedAt * 1000], JSON_THROW_ON_ERROR);

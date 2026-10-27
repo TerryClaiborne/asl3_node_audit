@@ -57,29 +57,33 @@ stamp();setInterval(stamp,1000);fetchMetrics();setTimeout(fetchMetrics,1000);set
 (()=>{'use strict';
 function parseVersion(value){const m=String(value||'').trim().match(/^v?(\d+)\.(\d+)\.(\d+)/i);return m?[Number(m[1]),Number(m[2]),Number(m[3])]:null}
 function newer(remote,local){const a=parseVersion(remote),b=parseVersion(local);if(!a||!b)return false;for(let i=0;i<3;i++){if(a[i]!==b[i])return a[i]>b[i]}return false}
-async function check(){const brand=document.getElementById('branding-title');if(!brand)return;const local=String(brand.dataset.localVersion||'').trim(),url=String(brand.dataset.versionUrl||'').trim();if(local)brand.title=`ASL3 Node Audit v${local}`;if(!local||!url)return;try{const r=await fetch(url,{method:'GET',cache:'no-store'});if(!r.ok)return;const remote=String(await r.text()).trim();if(newer(remote,local)){brand.classList.add('has-update');brand.title=`ASL3 Node Audit v${local} → v${remote} update available`;brand.setAttribute('aria-label',`Open the ASL3 Node Audit repository. Update available from version ${local} to ${remote}.`)}}catch(e){}}
+async function check(){const brand=document.getElementById('branding-title');if(!brand)return;const local=String(brand.dataset.localVersion||'').trim(),url=String(brand.dataset.versionUrl||'').trim();if(local)brand.title=`ASL3 Node Audit v${local}`;if(!local||!url)return;try{const r=await fetch(url,{method:'GET',cache:'no-store'});if(!r.ok)return;const remote=String(await r.text()).trim();if(newer(remote,local)){brand.classList.add('has-update');brand.title=`ASL3 Node Audit v${local} → v${remote} update available`;brand.setAttribute('aria-label',`Open the ASL3 Node Audit repository. Update available from version ${local} to ${remote}.`)}else{brand.classList.remove('has-update');brand.title=`ASL3 Node Audit v${local}`;brand.setAttribute('aria-label','Open the ASL3 Node Audit repository')}}catch(e){}}
 check();
 })();
 
-// Request a bounded audit when the dashboard opens, then no more than
-// once every 10 minutes while this dashboard remains visible.
-// refresh.php also enforces the 10-minute gate globally across browser windows.
+// Request a full audit immediately when the dashboard opens, then every
+// five minutes while the page remains open, including while it is hidden.
+// refresh.php enforces the same five-minute gate globally across browser windows.
 (()=>{
 'use strict';
 const token=document.body?.dataset.auditCsrf;
 if(!token)return;
 
-const INTERVAL=10*60*1000;
+let forceFirst=document.body?.dataset.forceAudit==='1';
+const ATTEMPT_INTERVAL=5*60*1000;
 let lastAttempt=0;
+let inFlight=false;
 
-function requestAudit(){
- if(document.hidden)return;
+function requestAudit(force=false){
  const now=Date.now();
- if(lastAttempt&&now-lastAttempt<INTERVAL)return;
+ if(inFlight)return;
+ if(!force&&lastAttempt&&now-lastAttempt<ATTEMPT_INTERVAL)return;
  lastAttempt=now;
+ inFlight=true;
 
  const body=new URLSearchParams();
  body.set('csrf',token);
+ if(forceFirst){body.set('force','1');forceFirst=false;}
 
  fetch('refresh.php',{
   method:'POST',
@@ -90,11 +94,17 @@ function requestAudit(){
    'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'
   },
   body:body.toString()
- }).catch(()=>{});
+ }).then(async res=>{
+  let data={ok:false,queued:false};
+  try{data=await res.json()}catch(e){}
+  window.dispatchEvent(new CustomEvent('asl3-audit-request',{detail:data}));
+ }).catch(()=>{
+  window.dispatchEvent(new CustomEvent('asl3-audit-request',{detail:{ok:false,queued:false}}));
+ }).finally(()=>{inFlight=false});
 }
 
-requestAudit();
-setInterval(requestAudit,INTERVAL);
+requestAudit(true);
+setInterval(requestAudit,ATTEMPT_INTERVAL);
 document.addEventListener('visibilitychange',()=>{
  if(!document.hidden)requestAudit();
 });

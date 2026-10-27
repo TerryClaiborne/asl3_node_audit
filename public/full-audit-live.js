@@ -3,11 +3,17 @@
 const $=s=>document.querySelector(s), all=s=>[...document.querySelectorAll(s)];
 const LEVELS=new Set(['PASS','WARN','FAIL','INFO','SKIP','UNKNOWN']);
 const MAX_AGE=null; // On-demand snapshots remain valid until the next refresh.
-let lastStamp=null, loading=false;
+const canTriggerAudit=Boolean(document.body?.dataset.auditCsrf);
+let lastStamp=null, loading=false, awaitingDecision=canTriggerAudit, auditPending=false, queuedAt=0;
 const el=(tag,cls,txt)=>{const x=document.createElement(tag);if(cls)x.className=cls;if(txt!==undefined)x.textContent=txt;return x;};
 const time=ms=>Number.isFinite(ms)?new Date(ms).toLocaleString():'';
 function status(label,health='muted'){
- const target=$('.mast-date');if(target)target.replaceChildren(el('span','','Full audit: '),el('strong','',label));
+ const target=$('.mast-date');
+ if(target){
+  target.replaceChildren(el('span','','Full audit: '),el('strong','',label));
+  target.classList.toggle('audit-running',health==='running');
+  target.classList.toggle('audit-error',health==='bad');
+ }
  const footer=$('footer span:first-child');if(footer)footer.textContent='ASL3 Node Audit · Automatically monitored · No automatic repairs';
 }
 function counters(totals){
@@ -85,7 +91,10 @@ function render(d){
     || !Array.isArray(d.sections)||d.sections.length!==15||d.status!=='CURRENT'){
    status('Overdue — new check required','bad');counters(null);return;
  }
- status(`Checked ${time(stamp)}`, 'good');
+ if(auditPending&&queuedAt&&stamp>=queuedAt){auditPending=false;awaitingDecision=false;queuedAt=0;}
+ if(awaitingDecision)status('Running full audit…','running');
+ else if(auditPending)status('Running full audit…','running');
+ else status(`Checked ${time(stamp)}`, 'good');
  counters(d.totals);
  if(lastStamp===d.checked_at_utc)return;
  lastStamp=d.checked_at_utc;
@@ -105,12 +114,29 @@ async function poll(){if(document.hidden||loading)return;loading=true;
    if(!res.ok)throw Error('Audit HTTP '+res.status);render(await res.json());
  }catch{status('Full audit unavailable — refresh failed','bad');counters(null)}finally{loading=false;}
 }
+
+window.addEventListener('asl3-audit-request',e=>{
+ const d=e.detail||{};
+ awaitingDecision=false;
+ if(d.ok&&d.queued){
+  auditPending=true;queuedAt=Number(d.queued_at_ms)||0;status('Running full audit…','running');
+ }else{
+  auditPending=false;queuedAt=0;poll();
+ }
+});
 function start(){
- // Avoid presenting the old report's counts/timestamp before the first updated feed.
- status('Stand by — gathering current audit information…');counters(null);findings([]);
- all('.tile-sub').forEach(x=>x.textContent='Checking…');
- all('.tile-badge').forEach(x=>x.textContent='…');
- poll();setInterval(poll,30000);
+ if(canTriggerAudit){
+  // An interactive page requests a fresh audit as it opens.  Keep the previous
+  // snapshot hidden until refresh.php tells us whether a new run was queued.
+  status('Running full audit…','running');counters(null);findings([]);
+  all('.tile-sub').forEach(x=>x.textContent='Checking…');
+  all('.tile-badge').forEach(x=>x.textContent='…');
+ }else{
+  // Signed-out view-only pages display the latest completed snapshot only.
+  // They never imply that an audit is running and never request one.
+  awaitingDecision=false;auditPending=false;queuedAt=0;
+ }
+ poll();setInterval(poll,5000);
  document.addEventListener('visibilitychange',()=>{if(!document.hidden)poll();});
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();

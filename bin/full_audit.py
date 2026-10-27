@@ -73,7 +73,7 @@ def parse_report(report: str) -> dict:
         raise ValueError('Counter inconsistency')
     return {'schema':1,'kind':'full_audit','coverage':'FULL','engine':'cli-adapter',
             'version':audit_version,'checked_at_utc':utc().isoformat(),
-            'status':'CURRENT','totals':totals,'sections':sections,'findings':findings}
+            'status':'CURRENT','totals':expected,'sections':sections,'findings':findings}
 
 
 def safe_write(path:Path,data:dict,mode:int):
@@ -127,9 +127,9 @@ def self_test():
     for i in range(1,16):
         sample+=f'\n=== {i}. Section {i} ===\n  [PASS   ] healthy\n'
         if i==13:sample+='    Timer unit                                Startup      Active\n      apt-daily.timer                          enabled      active\n'
-    sample+='\n=== 16. Priority findings ===\n=== 17. Report limitations ===\nTOTAL: 15 PASS | 0 WARN | 0 FAIL | 0 INFO | 0 SKIP | 0 UNKNOWN\n'
+    sample+='\n=== 16. Priority findings ===\n=== 17. Report limitations ===\n  [INFO   ] limitation row outside dashboard cards\nTOTAL: 15 PASS | 0 WARN | 0 FAIL | 1 INFO | 0 SKIP | 0 UNKNOWN\n'
     got=parse_report(sample)
-    assert len(got['sections'])==15 and got['totals']['PASS']==15
+    assert len(got['sections'])==15 and got['totals']['PASS']==15 and got['totals']['INFO']==0
     assert any(r['kind']=='columns' and len(r['cells'])==3 for r in got['sections'][12]['rows'])
     for bad in ('TOTAL: 0 PASS',sample.replace('=== 15. Section 15 ===',''),sample+'\x1b[31m'):
         try:parse_report(bad)
