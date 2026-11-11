@@ -61,56 +61,73 @@ ok() { echo "[OK] $*"; }
 ensure_shared_polling_hook() {
   local stock='CustomLog ${APACHE_LOG_DIR}/access.log combined'
   local shared='CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=!(reqenv('\''dontlog_app_polling'\'') == '\''1'\'' || (reqenv('\''dontlog_app_polling_200'\'') == '\''1'\'' && %{REQUEST_STATUS} == 200))"'
-  local site tmp backup_dir changed=0 warned=0
-  local -a sites=(
-    /etc/apache2/sites-available/000-default.conf
-    /etc/apache2/sites-available/default-ssl.conf
-  )
+  local link site tmp changed=0 warned=0
+  local -A seen=()
 
-  for site in "${sites[@]}"; do
-    [[ -f "$site" ]] || continue
+  # Examine the sites Apache actually enables, including ASL3 appliance HTTP/HTTPS.
+  # Resolve enabled symlinks and never edit an unrelated path or custom log rule.
+  while IFS= read -r -d '' link; do
+    site="$(readlink -f -- "$link")" || fail "Cannot resolve Apache site: $link"
+    case "$site" in
+      /etc/apache2/sites-available/*.conf) ;;
+      *) warn "Apache site is outside sites-available; not modifying: $link"; warned=1; continue ;;
+    esac
+    [[ -f "$site" && ! -L "$site" ]] || fail "Missing or unsafe Apache site: $site"
+    [[ -z "${seen[$site]+x}" ]] || continue
+    seen["$site"]=1
 
     if grep -Fq "$shared" "$site"; then
+      if grep -Eq '^[[:space:]]*CustomLog[[:space:]]+\$\{APACHE_LOG_DIR\}/access\.log[[:space:]]+combined[[:space:]]*$' "$site"; then
+        warn "Both filtered and unfiltered access-log rules found; leaving unchanged: $site"
+        warned=1
+      fi
       continue
     fi
 
-    if grep -Fxq "$stock" "$site"; then
-      if [[ -z "${backup_dir:-}" ]]; then
-        backup_dir="$BACKUP_ROOT/apache-accesslog-$(date -u +%Y%m%dT%H%M%SZ)"
-        install -d -o root -g root -m 0700 "$BACKUP_ROOT"
-        install -d -o root -g root -m 0700 "$backup_dir"
-      fi
-
-      cp -a "$site" "$backup_dir/$(basename "$site")"
+    if grep -Eq '^[[:space:]]*CustomLog[[:space:]]+\$\{APACHE_LOG_DIR\}/access\.log[[:space:]]+combined[[:space:]]*$' "$site"; then
+      # This backup is part of the existing installer rollback, not a separate
+      # directory that may be forgotten during a failed installation.
+      [[ -n "${backup:-}" && -f "$backup/backup.marker" ]] || fail "Protected setup backup is missing"
+      install -d -o root -g root -m 0700 "$backup/apache-sites"
+      [[ ! -e "$backup/apache-sites/$(basename "$site")" ]] || fail "Duplicate Apache-site backup: $site"
+      cp -a "$site" "$backup/apache-sites/$(basename "$site")" || fail "Could not back up Apache site: $site"
 
       tmp="$(mktemp)"
-      awk -v stock="$stock" -v shared="$shared" '
-        $0 == stock { print shared; changed=1; next }
-        { print }
-        END { if (!changed) exit 42 }
-      ' "$site" >"$tmp" || {
+      if ! awk -v stock="$stock" -v shared="$shared" '
+        {
+          line=$0
+          sub(/^[[:space:]]*/, "", line)
+          sub(/[[:space:]]*$/, "", line)
+          if (line == stock) {
+            prefix=$0
+            sub(/[^[:space:]].*$/, "", prefix)
+            print prefix shared
+            count++
+          } else print
+        }
+        END { if (count != 1) exit 42 }
+      ' "$site" > "$tmp"; then
         rm -f "$tmp"
-        fail "Could not install the shared Apache polling-log hook in $site."
-      }
-
-      cat "$tmp" >"$site"
+        fail "Could not safely replace the stock Apache logging rule: $site"
+      fi
+      cat "$tmp" > "$site" || { rm -f "$tmp"; fail "Could not update Apache site: $site"; }
       rm -f "$tmp"
+      echo "[INFO] Shared Apache polling logging installed: $site"
       changed=1
-      continue
-    fi
-
-    if grep -Eq '^[[:space:]]*CustomLog[[:space:]].*access\.log' "$site"; then
+    elif grep -Eq '^[[:space:]]*CustomLog[[:space:]].*access\.log' "$site"; then
       warn "$site has a custom access-log directive; leaving it untouched."
-      warn "Successful ASL3 Node Audit background requests may remain in access.log for that site."
+      warn "Successful Node Audit background requests may remain in access.log for that site."
+      warned=1
+    else
+      warn "No recognized access-log directive in enabled Apache site: $site"
       warned=1
     fi
-  done
+  done < <(find /etc/apache2/sites-enabled -maxdepth 1 -name '*.conf' -print0)
 
   if (( changed )); then
-    echo "[INFO] Installed the shared Apache polling-log hook without changing normal request logging."
-    [[ -z "${backup_dir:-}" ]] || echo "[INFO] Apache log backup: $backup_dir"
+    echo "[INFO] Shared Apache polling-log repair applied; rollback included in $backup"
   elif (( ! warned )); then
-    echo "[INFO] Shared Apache polling-log hook already present; existing app logging rules left untouched."
+    echo "[INFO] Shared Apache polling-log repair already present; existing rules unchanged."
   fi
 }
 
@@ -335,6 +352,18 @@ restore_backup() {
     if [[ -f "$dir/$saved" ]]; then install -o root -g root -m 0644 "$dir/$saved" "$target";
     elif [[ -f "$dir/$absent" ]]; then rm -f "$target"; fi
   done
+
+  # Restore only Apache site files this installer modified. Older backups
+  # without apache-sites/ remain compatible with --rollback.
+  if [[ -d "$dir/apache-sites" ]]; then
+    local saved target
+    for saved in "$dir"/apache-sites/*.conf; do
+      [[ -f "$saved" && ! -L "$saved" ]] || continue
+      target="/etc/apache2/sites-available/$(basename "$saved")"
+      [[ -f "$target" && ! -L "$target" ]] || fail "Cannot safely restore Apache site: $target"
+      cp -a "$saved" "$target" || fail "Could not restore Apache site: $target"
+    done
+  fi
 
   if command -v a2enconf >/dev/null 2>&1; then
     if [[ -f "$dir/apache-enabled" ]]; then a2enconf "$APACHE_CONF_NAME" >/dev/null 2>&1 || true; else a2disconf "$APACHE_CONF_NAME" >/dev/null 2>&1 || true; fi
