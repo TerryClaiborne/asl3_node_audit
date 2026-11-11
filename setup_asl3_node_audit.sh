@@ -673,14 +673,16 @@ done
 extra=(); [[ "$base" == https:* ]] && extra=(-k)
 auth_enabled="$(get_key ASL3_NODE_AUDIT_AUTH_ENABLED "$CONFIG_FILE")"
 [[ "$(curl_code "$base/asl3_node_audit/live.php" "${extra[@]}")" == "200" ]] || fail "live.php read-only view is unavailable."
-for private in config.ini src/auth.php run/web/security-feed.json; do
+for private in config.ini src/auth.php run/web/security-feed.json run/web/full-audit-feed.json run/web/audit-state.json; do
   code="$(curl_code "$base/asl3_node_audit/$private" "${extra[@]}")"
   [[ "$code" == "403" || "$code" == "404" ]] || fail "Private path is exposed: $private returned HTTP $code"
 done
 security_code="$(curl_code "$base/asl3_node_audit/data.php?feed=security" "${extra[@]}")"
 full_code="$(curl_code "$base/asl3_node_audit/data.php?feed=full" "${extra[@]}")"
+state_code="$(curl_code "$base/asl3_node_audit/data.php?feed=state" "${extra[@]}")"
 [[ "$security_code" == "200" || "$security_code" == "503" ]] || fail "Security feed endpoint returned unexpected HTTP $security_code."
 [[ "$full_code" == "200" || "$full_code" == "503" ]] || fail "Full audit feed endpoint returned unexpected HTTP $full_code."
+[[ "$state_code" == "200" || "$state_code" == "503" ]] || fail "Audit-state endpoint returned unexpected HTTP $state_code."
 
 node="$(get_key MYNODE "$CONFIG_FILE")"
 rollback_armed=0

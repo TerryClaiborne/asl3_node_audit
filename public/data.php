@@ -7,7 +7,7 @@ header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store, max-age=0');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
-$allowed = ['security' => 'security-feed.json', 'full' => 'full-audit-feed.json'];
+$allowed = ['security' => 'security-feed.json', 'full' => 'full-audit-feed.json', 'state' => 'audit-state.json'];
 $kind = $_GET['feed'] ?? '';
 if (!is_string($kind) || !array_key_exists($kind, $allowed)) {
     http_response_code(400);
@@ -31,6 +31,7 @@ try {
     $data = json_decode($raw, true, 128, JSON_THROW_ON_ERROR);
     if (!is_array($data) || ($data['schema'] ?? null) !== 1
         || ($kind === 'full' && ($data['kind'] ?? null) !== 'full_audit')
+        || ($kind === 'state' && ($data['kind'] ?? null) !== 'audit_state')
         || !isset($data['checked_at_utc'])) throw new RuntimeException('Invalid snapshot');
     echo json_encode($data, JSON_THROW_ON_ERROR);
 } catch (Throwable $e) {

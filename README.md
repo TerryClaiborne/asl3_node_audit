@@ -4,6 +4,14 @@ ASL3 Node Audit is a read-only diagnostic dashboard for an AllStarLink 3 node. I
 
 It is a diagnostic tool. It does not automatically repair configuration, install upgrades, reboot the node, change radio settings, or modify other applications. Its bounded security check refreshes Debian APT package metadata when needed so update information stays current; it does not install or upgrade packages.
 
+### v1.0.6 browser-trigger reliability
+
+- Opening or reopening an interactive dashboard requests a fresh audit unless one is already running.
+- Periodic refreshes remain globally gated to five minutes.
+- The dashboard reads a root-written audit-state feed, so **Running** reflects the monitor service state instead of a browser assumption.
+- Concurrent opens are coalesced, failed/timed-out runs are reported explicitly, and a stale RUNNING state cannot persist indefinitely.
+
+
 ## What it provides
 
 - 15 detailed diagnostic sections with PASS, WARN, FAIL, INFO, SKIP, and UNKNOWN results.
