@@ -460,6 +460,7 @@ done
 
 bash -n "$APP_DIR/setup_asl3_node_audit.sh"
 bash -n "$APP_DIR/bin/asl3-node-audit.sh"
+bash "$APP_DIR/bin/asl3-node-audit.sh" --self-test >/dev/null || fail "Shell audit self-test failed."
 while IFS= read -r php_file; do php -l "$php_file" >/dev/null || fail "PHP syntax failed: $php_file"; done < <(find "$APP_DIR/public" "$APP_DIR/src" -type f -name '*.php' -print | sort)
 while IFS= read -r py_file; do python3 -m py_compile "$py_file" || fail "Python syntax failed: $py_file"; done < <(find "$APP_DIR/bin" "$APP_DIR/src" -type f -name '*.py' -print | sort)
 find "$APP_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
@@ -651,13 +652,12 @@ sudo -u "$WEB_USER" test ! -w "$APP_DIR/src" || fail "src/ must not be writable 
 sudo -u "$WEB_USER" test -w "$APP_DIR/run/auth" || fail "run/auth must be writable by $WEB_USER"
 sudo -u "$WEB_USER" test ! -w "$APP_DIR/run/web" || fail "run/web must not be writable by $WEB_USER"
 
-echo "[INFO] Running initial Node Audit checks. This may take a few minutes on slower systems..."
-systemctl start asl3-node-audit.service || fail "Initial ASL3 Node Audit monitor run failed."
-echo "[OK] Initial Node Audit checks completed."
-result="$(systemctl show asl3-node-audit.service -p Result --value)"
-status="$(systemctl show asl3-node-audit.service -p ExecMainStatus --value)"
-[[ "$result" == "success" && "$status" == "0" ]] || fail "Initial monitor result was $result/$status"
+# Do not block setup on a full audit/APT security refresh. The dashboard already
+# requests a fresh audit when it opens, and the path unit handles subsequent
+# browser-triggered requests. This keeps installation fast while preserving
+# the same on-demand audit behavior.
 systemctl enable --now asl3-node-audit.path >/dev/null
+echo "[OK] On-demand Node Audit monitoring enabled; a fresh audit will run when the dashboard opens."
 
 # Local route checks. HTTP is preferred; HTTPS is a fallback. No hostname setting is required.
 curl_code() {
@@ -677,8 +677,10 @@ for private in config.ini src/auth.php run/web/security-feed.json; do
   code="$(curl_code "$base/asl3_node_audit/$private" "${extra[@]}")"
   [[ "$code" == "403" || "$code" == "404" ]] || fail "Private path is exposed: $private returned HTTP $code"
 done
-[[ "$(curl_code "$base/asl3_node_audit/data.php?feed=security" "${extra[@]}")" == "200" ]] || fail "Security feed is not available."
-[[ "$(curl_code "$base/asl3_node_audit/data.php?feed=full" "${extra[@]}")" == "200" ]] || fail "Full audit feed is not available."
+security_code="$(curl_code "$base/asl3_node_audit/data.php?feed=security" "${extra[@]}")"
+full_code="$(curl_code "$base/asl3_node_audit/data.php?feed=full" "${extra[@]}")"
+[[ "$security_code" == "200" || "$security_code" == "503" ]] || fail "Security feed endpoint returned unexpected HTTP $security_code."
+[[ "$full_code" == "200" || "$full_code" == "503" ]] || fail "Full audit feed endpoint returned unexpected HTTP $full_code."
 
 node="$(get_key MYNODE "$CONFIG_FILE")"
 rollback_armed=0

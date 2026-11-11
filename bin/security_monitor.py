@@ -150,7 +150,14 @@ def snapshot_to_feed():
         return {'schema':1,'state':'UNAVAILABLE','checked_at_utc':None,'apt_state':'UNVERIFIED',
                 'security_count':None,'other_count':None,'security_packages':[],
                 'alarm':'UNAVAILABLE','coverage':'PARTIAL','lan_ip':lan_ip(),
-                'message':'Security check unavailable — retry scheduled'}
+                'problem':{
+                    'category':'SECURITY_COLLECTOR_UNAVAILABLE',
+                    'summary':'The security collector did not produce a usable current snapshot.',
+                    'impact':'Security-update status and critical-security checks cannot be treated as verified.',
+                    'action':'Inspect the Node Audit service log and retry the monitor cycle.',
+                    'verify':'sudo systemctl start asl3-node-audit.service && journalctl -u asl3-node-audit.service -n 100 --no-pager'
+                },
+                'message':'Security collector unavailable'}
     snap=json.loads((RUN/'latest-critical.json').read_text(encoding='utf8'))
     apt=snap.get('package_security_updates',{})
     apt_ok=(state.get('apt_security_state')=='CHECKED' and
@@ -164,6 +171,20 @@ def snapshot_to_feed():
             if not all(isinstance(p.get(k),str) and len(p[k])<=128 for k in ('package','installed','candidate')):
                 apt_ok=False; break
             packs.append({k:p[k] for k in ('package','installed','candidate')})
+    problem=None
+    if not apt_ok:
+        raw_problem=apt.get('refresh_problem') if isinstance(apt.get('refresh_problem'),dict) else None
+        if raw_problem:
+            allowed=('category','summary','impact','action','verify','repository','checked_at_utc')
+            problem={k:raw_problem[k] for k in allowed if isinstance(raw_problem.get(k),str)}
+        else:
+            problem={
+                'category':'APT_SECURITY_UNVERIFIED',
+                'summary':str(apt.get('reason') or 'Debian security-update status could not be verified.')[:700],
+                'impact':'Security-update status cannot be treated as clean.',
+                'action':'Run the APT verification command and correct any reported repository, network or package-metadata error.',
+                'verify':'sudo apt-get -o APT::Update::Error-Mode=any update'
+            }
     return {'schema':1,'state':state['state'],
             'checked_at_utc':snap['checked_at_utc'],
             'apt_state':'CHECKED' if apt_ok else 'UNVERIFIED',
@@ -171,6 +192,7 @@ def snapshot_to_feed():
             'other_count':apt.get('other_count') if apt_ok else None,
             'security_packages':packs if apt_ok else [],
             'apt_refreshed_at_utc':apt.get('apt_refreshed_at_utc') if apt_ok else None,
+            'problem':problem,
             'alarm':state['alarm'],'coverage':'PARTIAL','lan_ip':lan_ip(),
             'message':'Critical-security monitoring only; full diagnostics run separately'}
 
@@ -192,18 +214,41 @@ def once():
                         {'apt_refreshed_at_utc':now().isoformat()},0o600)
             refresh=command(['python3',str(APP/'src/apt_security.py'),'--refresh'],330)
             if refresh.returncode:
-                print('WARNING: APT refresh incomplete; security status remains unverified',file=sys.stderr)
+                # apt_security.py emits only sanitized diagnostics; preserve them in the journal
+                # so an operator sees the real cause without rerunning a separate command.
+                detail=(refresh.stderr or refresh.stdout).strip()
+                print('WARNING: APT refresh incomplete; Debian security-update status is not verified.',file=sys.stderr)
+                if detail:
+                    print(detail,file=sys.stderr)
         result=command(['python3',str(APP/'bin/monitor_runner.py'),'--once'],120)
         if result.returncode: print('WARNING: Security collector did not complete',file=sys.stderr)
         data=snapshot_to_feed()
         if not authorized():
             data['alarm']='TRIGGERED'
+            data['alarm_problem']={
+                'summary':'Node Audit dashboard/private-path self-check failed.',
+                'impact':'The audit could not verify both the public dashboard route and protection of private application paths.',
+                'action':'Inspect Apache configuration and the Node Audit Alias/access rules before exposing the dashboard beyond a trusted network.',
+                'verify':'sudo apache2ctl configtest && curl -I http://127.0.0.1/asl3_node_audit/'
+            }
             data['message']='Dashboard route/private-path verification needs attention'
             print('WARNING: Dashboard route/private-path verification failed',file=sys.stderr)
         if FEED.is_symlink(): raise RuntimeError('Unsafe private feed path')
         atomic_json(FEED,data,0o640)
-        print('PASS: Security feed published securely:',data['state'],
-              data['apt_state'],data['security_count'])
+        if data.get('apt_state')=='CHECKED':
+            print('PASS: Security feed published securely:',data['state'],
+                  data['apt_state'],data['security_count'])
+        else:
+            problem=data.get('problem') if isinstance(data.get('problem'),dict) else {}
+            print('ATTENTION: Security feed published, but Debian security-update verification is incomplete.',file=sys.stderr)
+            if problem.get('summary'):
+                print('Reason:',problem['summary'],file=sys.stderr)
+            if problem.get('repository'):
+                print('Affected repository:',problem['repository'],file=sys.stderr)
+            if problem.get('action'):
+                print('Next:',problem['action'],file=sys.stderr)
+            if problem.get('verify'):
+                print('Verify:',problem['verify'],file=sys.stderr)
         return 0 if result.returncode==0 else 3
     finally:
         fcntl.flock(fd,fcntl.LOCK_UN);os.close(fd)

@@ -9,6 +9,7 @@ VERSION="$(tr -d '\r\n' < "$APP_ROOT/VERSION" 2>/dev/null || printf '0.0.0')"
 NO_COLOR=0
 INTERNAL_RENDER=0
 SUMMARY_FIRST=0
+SELF_TEST=0
 TIMEOUT_SECS=5
 for a in "$@"; do
   case "$a" in
@@ -16,6 +17,7 @@ for a in "$@"; do
     --no-color) NO_COLOR=1 ;;
     --internal-render) INTERNAL_RENDER=1 ;;
     --summary-first) SUMMARY_FIRST=1 ;;
+    --self-test) SELF_TEST=1 ;;
     --version) echo "ASL3 Node Audit $VERSION"; exit 0 ;;
     -h|--help) printf 'Usage: sudo bash %s [--full] [--no-color] [--summary-first]\n  --full           Run the complete read-only 15-section audit (also the default).\n  --no-color       Disable ANSI colors for logs/copy-paste.\n  --summary-first  Show priority findings before the complete report.\n  --version        Print the installed audit version.\nRead-only. No apt-get update or service changes.\n' "$0"; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$a" >&2; exit 2 ;;
@@ -41,8 +43,17 @@ if [[ -t 1 && "$NO_COLOR" == 0 ]]; then
   GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; BLUE=$'\033[36m'; RESET=$'\033[0m'
 else GREEN=; YELLOW=; RED=; BLUE=; RESET=; fi
 PASS=0; WARN=0; FAIL=0; INFO=0; SKIP=0; UNKNOWN=0
-declare -a FINDINGS=()
+declare -a FINDING_LEVELS=() FINDING_MESSAGES=() FINDING_HINTS=()
 section() { printf '\n=== %s ===\n' "$1"; }
+print_hint() {
+  local hint="$1" expanded part
+  [[ -n "$hint" ]] || return 0
+  expanded="${hint// @@@ /$'\n'}"
+  while IFS= read -r part; do
+    part="${part# }"; part="${part% }"
+    [[ -n "$part" ]] && printf '            %s\n' "$part"
+  done <<< "$expanded"
+}
 report() {
   local tag="$1" msg="$2" hint="${3:-}" color=""
   case "$tag" in
@@ -53,17 +64,26 @@ report() {
     SKIP) ((SKIP+=1)); color=$BLUE ;;
     UNKNOWN) ((UNKNOWN+=1)); color=$YELLOW ;;
   esac
-  printf '  %s[%-7s]%s %s\n' "$color" "$tag" "$RESET" "$msg"
-  if [[ "$tag" == WARN || "$tag" == FAIL || "$tag" == UNKNOWN ]]; then FINDINGS+=("$tag|$msg|$hint"); fi
-  if [[ -n "$hint" ]]; then
-    local part
-    IFS='|' read -ra parts <<< "$hint"
-    for part in "${parts[@]}"; do
-      part="${part# }"; part="${part% }"
-      printf '            %s\n' "$part"
-    done
+  if [[ ("$tag" == WARN || "$tag" == FAIL || "$tag" == UNKNOWN) && -z "$hint" ]]; then
+    hint='Next: inspect the condition named above and the relevant local service/configuration; rerun the audit after any intentional correction. No automatic change is made.'
   fi
+  printf '  %s[%-7s]%s %s\n' "$color" "$tag" "$RESET" "$msg"
+  if [[ "$tag" == WARN || "$tag" == FAIL || "$tag" == UNKNOWN ]]; then
+    FINDING_LEVELS+=("$tag")
+    FINDING_MESSAGES+=("$msg")
+    FINDING_HINTS+=("$hint")
+  fi
+  print_hint "$hint"
 }
+if (( SELF_TEST == 1 )); then
+  sample='Reason: SSH policy observed. @@@ Impact: direct login may be possible. @@@ Next: sudo sshd -T | grep -Ei "permitrootlogin|passwordauthentication|pubkeyauthentication"'
+  rendered="$(print_hint "$sample")"
+  expected=$'            Reason: SSH policy observed.\n            Impact: direct login may be possible.\n            Next: sudo sshd -T | grep -Ei "permitrootlogin|passwordauthentication|pubkeyauthentication"'
+  [[ "$rendered" == "$expected" ]] || { printf 'SELF-TEST FAIL: diagnostic hint formatting\n' >&2; exit 2; }
+  printf 'PASS: shell diagnostic formatting self-test\n'
+  exit 0
+fi
+
 have() { command -v "$1" >/dev/null 2>&1; }
 root() { [[ $EUID -eq 0 ]]; }
 installed() { have dpkg-query && [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) == ii* ]]; }
@@ -76,27 +96,51 @@ listen_udp() { [[ -n "${UDPSOCKETS:-}" ]] && printf '%s\n' "$UDPSOCKETS" | awk -
 # Returns success when an *unrestricted* local bind is seen; NOT an internet reachability test.
 bind_any_tcp() { printf '%s\n' "${TCPSOCKETS:-}" | awk -v p=":$1" '$4 ~ p"$" && ($4 ~ /^0\\.0\\.0\\.0:/ || $4 ~ /^\\*:/ || $4 ~ /^\\[::\\]:/) {f=1} END{exit !f}'; }
 service_status() {
-  local svc="$1" desc="$2" expected="${3:-optional}" state
-  if ! service_exists "$svc"; then report SKIP "$desc: not installed as a systemd service."; return; fi
+  local svc="$1" desc="$2" expected="${3:-optional}" state enabled
+  if ! service_exists "$svc"; then
+    if [[ "$expected" == required ]]; then
+      report FAIL "$desc: required systemd service is not installed/loaded." "Reason: systemd could not load $svc. @@@ Next: verify the required package is installed and inspect: systemctl status $svc --no-pager"
+    else
+      report INFO "$desc: not installed as a systemd service (may be intentional for this node)."
+    fi
+    return
+  fi
   state=$(systemctl is-active "$svc" 2>/dev/null || true)
+  enabled=$(systemctl is-enabled "$svc" 2>/dev/null || true)
   case "$state" in
     active) report PASS "$desc: active." ;;
     failed)
       if [[ "$expected" == required ]]; then
-        report FAIL "$desc: FAILED (required for normal node operation)." "Inspect: systemctl status $svc --no-pager"
+        report FAIL "$desc: FAILED (required for normal operation)." "Reason: systemd reports $svc in the failed state. @@@ Next: inspect: systemctl status $svc --no-pager @@@ Verify: systemctl is-active $svc"
       else
-        report WARN "$desc: failed (optional or role-dependent service)." "Inspect: systemctl status $svc --no-pager"
+        report WARN "$desc: failed (role-dependent/optional service)." "Reason: systemd reports a real failed state, not a clean intentional stop. @@@ Next: if this node is intended to use the service, inspect: systemctl status $svc --no-pager; otherwise review the owning application's configuration."
       fi ;;
     inactive)
       if [[ "$expected" == required ]]; then
-        report WARN "$desc: inactive (required for normal node operation)." "Check: systemctl status $svc --no-pager"
-      elif service_enabled "$svc"; then
-        report WARN "$desc: enabled but inactive." "Check whether this service is expected to run."
+        report FAIL "$desc: inactive (required for normal operation)." "Reason: the required service is not running. @@@ Next: inspect: systemctl status $svc --no-pager @@@ Verify: systemctl is-active $svc"
       else
-        report INFO "$desc: inactive/disabled (may be intentional)."
+        report INFO "$desc: inactive (startup: ${enabled:-unknown}); role-dependent inactivity may be intentional."
       fi ;;
-    *) report UNKNOWN "$desc: state ${state:-unknown}." ;;
+    activating|deactivating|reloading)
+      report INFO "$desc: transitional state $state (startup: ${enabled:-unknown}); recheck if it persists." ;;
+    *) report UNKNOWN "$desc: systemd state ${state:-unknown} could not be classified." "Reason: systemctl did not return a recognized stable state for $svc. @@@ Next: inspect: systemctl status $svc --no-pager" ;;
   esac
+}
+
+security_monitor_summary() {
+  # Read-only summary; Debian security-update status is separate from audit counters.
+  if have python3 && [[ -f "$APP_ROOT/src/apt_security.py" ]]; then
+    local out
+    out=$(python3 "$APP_ROOT/src/apt_security.py" --summary 2>/dev/null || true)
+    if [[ -n "$out" ]]; then
+      printf '    Debian security monitor (separate from audit counters):\n'
+      while IFS= read -r line; do printf '      %s\n' "$line"; done <<< "$out"
+    else
+      printf '    Debian security monitor: no readable classification was returned.\n'
+    fi
+  else
+    printf '    Debian security monitor: helper unavailable; security-update status cannot be classified here.\n'
+  fi
 }
 
 printf 'ASL3 NODE AUDIT v%s | %s\n' "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -110,21 +154,21 @@ if [[ -r /etc/os-release ]]; then
   OS_CODENAME=$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-unknown}")
   OS_PRETTY=$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")
   report INFO "OS: $OS_PRETTY"
-else OS_CODENAME=unknown; report UNKNOWN 'Cannot identify operating system.'; fi
-if ! have dpkg-query; then report FAIL 'This checker requires a Debian/dpkg-based OS.'; exit 2; fi
+else OS_CODENAME=unknown; report UNKNOWN 'Cannot identify operating system.' 'Reason: /etc/os-release is missing or unreadable. @@@ Next: inspect: ls -l /etc/os-release; cat /etc/os-release'; fi
+if ! have dpkg-query; then report FAIL 'This checker requires a Debian/dpkg-based OS.' 'Reason: dpkg-query is unavailable. @@@ Next: run this tool only on a supported Debian/ASL3 system.'; exit 2; fi
 if installed asl3 || installed asl3-asterisk; then
   report PASS 'ASL3 package detected.'
 else
-  report FAIL 'ASL3 packages not detected; health results may not apply.' 'Run on an ASL3 machine; no automatic changes will be made.'
+  report FAIL 'ASL3 packages not detected; health results may not apply.' 'Reason: neither asl3 nor asl3-asterisk was detected as installed. @@@ Next: verify: dpkg-query -W asl3 asl3-asterisk'
 fi
 case "$OS_CODENAME" in
   trixie|bookworm) report PASS "Recognized Debian release: $OS_CODENAME." ;;
-  bullseye|buster|stretch) report WARN "Older Debian release ($OS_CODENAME); verify support and updates." ;;
-  *) report UNKNOWN "OS codename $OS_CODENAME: support status not assessed." ;;
+  bullseye|buster|stretch) report WARN "Older Debian release ($OS_CODENAME); verify support and updates." 'Reason: the detected Debian release is older than the currently tested Trixie/Bookworm targets. @@@ Next: verify current ASL3 support policy before planning an OS upgrade.' ;;
+  *) report UNKNOWN "OS codename $OS_CODENAME: support status not assessed." 'Reason: this release is outside the audit tested-release list. @@@ Next: compare the installed OS with the README tested-platform section.' ;;
 esac
 report INFO "Running kernel: $(uname -r)"
 if [[ -e /run/reboot-required || -e /var/run/reboot-required ]]; then
-  report WARN 'A reboot-required marker exists.' 'To inspect marker: ls -l /run/reboot-required /var/run/reboot-required 2>/dev/null | Reboot only during planned maintenance: sudo reboot'
+  report WARN 'A reboot-required marker exists.' 'To inspect marker: ls -l /run/reboot-required /var/run/reboot-required 2>/dev/null @@@ Reboot only during planned maintenance: sudo reboot'
 else
   report INFO 'No reboot-required marker (absence does NOT prove the running kernel is current).'
 fi
@@ -135,8 +179,8 @@ fi
 if [[ -d /boot ]]; then
   BOOTFREE=$(df -P /boot 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5);print $5}')
   if [[ "$BOOTFREE" =~ ^[0-9]+$ ]]; then
-    if ((BOOTFREE >= 90)); then report FAIL '/boot filesystem is at least 90% used.'
-    elif ((BOOTFREE >= 80)); then report WARN '/boot filesystem is at least 80% used.'
+    if ((BOOTFREE >= 90)); then report FAIL '/boot filesystem is at least 90% used.' 'Impact: kernel/package updates may fail if /boot runs out of space. @@@ Next: inspect: df -hP /boot; dpkg -l "linux-image*"; remove old kernels only through normal package management.'
+    elif ((BOOTFREE >= 80)); then report WARN '/boot filesystem is at least 80% used.' 'Impact: future kernel/package updates have reduced free space. @@@ Next: inspect: df -hP /boot; review old kernel packages before removing anything.'
     else report PASS '/boot filesystem usage below 80%.'; fi
   fi
 fi
@@ -144,14 +188,14 @@ fi
 section '2. Updates and package integrity'
 if have apt; then
   APTLIST=$(apt list --upgradable 2>/dev/null | awk 'NR>1 && /\[upgradable from:/ {++n} END {print n+0}')
-  if ((APTLIST>0)); then report INFO "$APTLIST package(s) show available updates in cached APT data; security classification is reported separately by the security monitor." 'To refresh: sudo apt update | To list packages: apt list --upgradable | To simulate only: sudo apt-get -s upgrade | To install when ready: sudo apt upgrade'
+  if ((APTLIST>0)); then report INFO "$APTLIST package(s) show available updates in cached APT data; security classification is reported separately by the security monitor." 'To refresh: sudo apt update @@@ To list packages: apt list --upgradable @@@ To simulate only: sudo apt-get -s upgrade @@@ To install when ready: sudo apt upgrade'
   else report INFO 'No upgrades shown in locally cached apt lists; they may be stale.'; fi
   LISTDATE=$(find /var/lib/apt/lists -maxdepth 1 -type f -name '*InRelease' -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
   if [[ "$LISTDATE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     AGEDAYS=$(awk -v now="$(date +%s)" -v then="$LISTDATE" 'BEGIN{printf "%.0f", (now-then)/86400}')
     if ((AGEDAYS > 14)); then report WARN "APT metadata is approximately $AGEDAYS days old." 'To refresh the package lists: sudo apt update'
     else report INFO "APT metadata approximately $AGEDAYS days old."; fi
-  else report UNKNOWN 'APT metadata freshness could not be determined.'; fi
+  else report UNKNOWN 'APT metadata freshness could not be determined.' 'Reason: no usable InRelease timestamp was found in /var/lib/apt/lists. @@@ Next: run sudo apt-get -o APT::Update::Error-Mode=any update and correct any reported repository error.'; fi
 fi
 if have dpkg; then
   AUDIT=$(runquick dpkg --audit || true)
@@ -164,6 +208,7 @@ if installed unattended-upgrades; then
   else report INFO 'Unattended-upgrades installed, but periodic configuration not confirmed enabled.'; fi
   if service_exists apt-daily-upgrade.timer; then service_status apt-daily-upgrade.timer 'Automatic upgrade timer'; fi
 else report INFO 'unattended-upgrades package not installed.'; fi
+security_monitor_summary
 
 section '3. Asterisk and ASL3 services'
 service_status asterisk.service Asterisk required
@@ -172,14 +217,14 @@ if have asterisk; then
   if [[ "$AOUT" == *'System uptime:'* || "$AOUT" == *'Last reload:'* ]]; then report PASS 'Asterisk CLI responds.'
   else report WARN 'Asterisk CLI did not return expected uptime information.' 'Check: sudo asterisk -rx "core show uptime"'; fi
   REGOUT=$(runquick asterisk -rx 'rpt show registrations' || true)
-  if [[ -z "$REGOUT" ]]; then report UNKNOWN 'ASL registration command returned no output.'
-  elif [[ "$REGOUT" == *'No such command'* || "$REGOUT" == *'Unable to connect'* ]]; then report UNKNOWN 'Registration status command is unavailable or Asterisk is unreachable.'
+  if [[ -z "$REGOUT" ]]; then report UNKNOWN 'ASL registration command returned no output.' 'Reason: Asterisk returned no usable registration text before the command timeout. @@@ Next: inspect: sudo asterisk -rx "rpt show registrations"'
+  elif [[ "$REGOUT" == *'No such command'* || "$REGOUT" == *'Unable to connect'* ]]; then report UNKNOWN 'Registration status command is unavailable or Asterisk is unreachable.' 'Reason: the expected command is missing or the CLI cannot reach Asterisk. @@@ Next: inspect: sudo asterisk -rx "rpt show registrations"; systemctl status asterisk --no-pager'
   else
     report INFO 'Registration command responded; status must be interpreted against your configured nodes.'
     if printf '%s\n' "$REGOUT" | grep -Eiq 'reject|fail|unregistered|timeout'; then report WARN 'Registration output contains possible failure terminology.' 'Inspect manually: sudo asterisk -rx "rpt show registrations"'; fi
   fi
-else report FAIL 'Asterisk executable not found.'; fi
-if [[ -f /etc/asterisk/rpt.conf ]]; then report PASS 'rpt.conf exists.'; else report WARN 'rpt.conf not found at expected path.'; fi
+else report FAIL 'Asterisk executable not found.' 'Reason: no asterisk executable is available in PATH. @@@ Next: verify: dpkg-query -W asl3-asterisk; command -v asterisk'; fi
+if [[ -f /etc/asterisk/rpt.conf ]]; then report PASS 'rpt.conf exists.'; else report WARN 'rpt.conf not found at expected path.' 'Reason: /etc/asterisk/rpt.conf is absent; it may be generated/included elsewhere or the ASL3 configuration may be incomplete. @@@ Next: inspect /etc/asterisk and the installed asl3-asterisk-config package before changing anything.'; fi
 MANAGER_MODE=
 if [[ -f /etc/asterisk/manager.conf ]]; then
   report INFO 'manager.conf exists; credentials are not displayed.'
@@ -201,7 +246,7 @@ if have ss; then
   else report WARN "No UDP/$IAX_PORT listener found (verify this node needs IAX2)." 'Check: sudo ss -lunp'; fi
   if listen_tcp 5038; then
     if bind_any_tcp 5038; then
-      report WARN 'AMI TCP/5038 bound to all interfaces; assess trusted hosts and router/firewall forwarding.'
+      report WARN 'AMI TCP/5038 bound to all interfaces; assess trusted hosts and router/firewall forwarding.' 'Reason: a local AMI listener was observed on a wildcard address. @@@ Impact: network exposure depends on firewall/router policy and AMI ACLs. @@@ Next: review manager.conf permit/deny rules and local firewall/router forwarding before changing the bind.'
     else
       report PASS 'AMI TCP/5038 is not bound to all interfaces.'
     fi
@@ -215,26 +260,22 @@ if have ss; then
   elif [[ "$MANAGER_MODE" =~ ^[0-9]+$ ]]; then
     report PASS "manager.conf mode $MANAGER_MODE does not permit other-user read access."
   elif [[ -f /etc/asterisk/manager.conf ]]; then
-    report UNKNOWN 'manager.conf permissions could not be interpreted.'
+    report UNKNOWN 'manager.conf permissions could not be interpreted.' 'Reason: stat did not return a valid numeric mode. @@@ Next: inspect: stat /etc/asterisk/manager.conf'
   fi
 else
-  TCPSOCKETS=; UDPSOCKETS=; report UNKNOWN 'ss not available; listener checks skipped.'
+  TCPSOCKETS=; UDPSOCKETS=; report UNKNOWN 'ss not available; listener checks skipped.' 'Reason: the ss command (normally from iproute2) is unavailable. @@@ Impact: local TCP/UDP listener checks cannot be verified. @@@ Next: verify: command -v ss; dpkg-query -W iproute2'
   if [[ "$MANAGER_MODE" =~ ^[0-9]+$ ]] && (( (8#$MANAGER_MODE & 8#004) != 0 )); then
     report INFO "manager.conf mode $MANAGER_MODE permits local-user read access; network AMI exposure could not be checked because ss is unavailable."
   fi
-fi
-if have systemctl; then
-  FAILEDUNITS=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '$1 ~ /\.(service|socket|timer|mount)$/ {++n} END{print n+0}')
-  if ((FAILEDUNITS>0)); then report WARN "$FAILEDUNITS failed systemd unit(s) detected." 'To inspect: systemctl --failed --no-pager'
-  else report PASS 'No failed systemd units reported.'; fi
 fi
 for name in analog_bridge mmdvm_bridge ircddbgateway ysfgateway p25gateway nxdngateway hblink tgifd bmtd; do
   service_exists "$name.service" && service_status "$name.service" "$name"
 done
 
 section '4. Web services and dashboard discovery'
-for svc in apache2 nginx php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm cockpit.socket fail2ban; do
-  service_exists "$svc" && service_status "$svc" "$svc"
+if service_exists apache2.service; then service_status apache2.service apache2 required; fi
+for svc in nginx php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm cockpit.socket fail2ban; do
+  service_exists "$svc" && service_status "$svc" "$svc" optional
 done
 if [[ -d /var/www/html ]]; then
   report PASS 'Web root /var/www/html exists.'
@@ -288,19 +329,19 @@ if listen_tcp 80 || listen_tcp 443; then report INFO 'HTTP and/or HTTPS port is 
 section '5. Network, firewall and login security'
 if have ip; then
   ROUTE=$(runquick ip route show default || true)
-  if [[ -n "$ROUTE" ]]; then report PASS 'Default IPv4 route present.'; else report WARN 'No default IPv4 route found.'; fi
+  if [[ -n "$ROUTE" ]]; then report PASS 'Default IPv4 route present.'; else report WARN 'No default IPv4 route found.' 'Reason: ip route did not show a default IPv4 route. @@@ Impact: normal outbound IPv4 connectivity may be unavailable. @@@ Next: inspect: ip route; nmcli device status'; fi
   V6GLOBAL=$(ip -6 -o addr show scope global 2>/dev/null | awk '$4 !~ /^[fF][cCdD]/ {++n} END {print n+0}')
   if ((V6GLOBAL>0)); then report INFO 'At least one global IPv6 address is configured; review IPv6 firewall and router policy.'; fi
 fi
 if have timedatectl; then
   SYNC=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
-  case "$SYNC" in yes) report PASS 'System time reports synchronized.' ;; no) report WARN 'Time synchronization is not confirmed.' ;; *) report UNKNOWN 'Time sync status unavailable.' ;; esac
+  case "$SYNC" in yes) report PASS 'System time reports synchronized.' ;; no) report WARN 'Time synchronization is not confirmed.' 'Reason: timedatectl reports NTPSynchronized=no. @@@ Next: inspect: timedatectl status; systemctl status systemd-timesyncd --no-pager' ;; *) report UNKNOWN 'Time sync status unavailable.' 'Reason: timedatectl did not return a usable NTPSynchronized value. @@@ Next: inspect: timedatectl show -p NTPSynchronized --value' ;; esac
 fi
 if service_active fail2ban; then
   report PASS 'Fail2Ban is active.'
   if have fail2ban-client; then
     JAILS=$(runquick fail2ban-client status | sed -n 's/.*Jail list:[[:space:]]*//p' || true)
-    if [[ -n "$JAILS" ]]; then report INFO 'Fail2Ban has configured jails (names omitted from summary).'; else report UNKNOWN 'Fail2Ban active but jail list not verified.'; fi
+    if [[ -n "$JAILS" ]]; then report INFO 'Fail2Ban has configured jails (names omitted from summary).'; else report UNKNOWN 'Fail2Ban active but jail list not verified.' 'Reason: fail2ban-client did not return a usable jail list. @@@ Next: inspect: sudo fail2ban-client status; systemctl status fail2ban --no-pager'; fi
   fi
 else report INFO 'Fail2Ban not active; consider exposure and whether other protections exist.'; fi
 if have ufw; then
@@ -314,21 +355,21 @@ if root && have nft; then
   if [[ -n "$NFT" ]]; then
     report INFO 'nftables rules present; Fail2Ban chains alone do not prove general firewall protection.'
     if printf '%s\n' "$NFT" | grep -Eq 'hook input.*policy drop'; then report INFO 'At least one nftables input chain uses a drop policy (actual exposure depends on all rules).'; fi
-  else report UNKNOWN 'No readable nftables ruleset (may be unused or inaccessible).'; fi
+  else report UNKNOWN 'No readable nftables ruleset (may be unused or inaccessible).' 'Reason: nft returned no usable ruleset during local firewall inspection. @@@ Next: inspect: sudo nft list ruleset; firewall-cmd --state 2>/dev/null'; fi
 fi
 if have sshd; then
   SSHD=$(runquick sshd -T || true)
   if [[ -n "$SSHD" ]]; then
     if grep -Eiq '^permitemptypasswords yes' <<< "$SSHD"; then
-      report FAIL 'SSH permits empty passwords in effective configuration.'
+      report FAIL 'SSH permits empty passwords in effective configuration.' 'Reason: sshd -T reports PermitEmptyPasswords=yes. @@@ Impact: accounts without passwords may be accepted depending on other SSH/PAM settings. @@@ Next: correct the effective SSH configuration and verify with: sudo sshd -T | grep -i permitemptypasswords'
     elif grep -Eiq '^permitemptypasswords no' <<< "$SSHD"; then
       report PASS 'SSH explicitly disallows empty passwords.'
     else
-      report UNKNOWN 'Effective SSH empty-password setting could not be established.'
+      report UNKNOWN 'Effective SSH empty-password setting could not be established.' 'Reason: sshd -T did not return a recognized PermitEmptyPasswords value. @@@ Next: inspect: sudo sshd -T; sudo sshd -t'
     fi
-    if grep -Eiq '^permitrootlogin yes' <<< "$SSHD"; then report WARN 'SSH permits root login; check effective authentication methods.'; fi
+    if grep -Eiq '^permitrootlogin yes' <<< "$SSHD"; then report WARN 'SSH permits root login; check effective authentication methods.' 'Reason: sshd -T reports PermitRootLogin=yes. @@@ Impact: root can authenticate directly if an allowed authentication method succeeds. @@@ Next: review root-login and authentication policy with: sudo sshd -T | grep -Ei "permitrootlogin|passwordauthentication|pubkeyauthentication"'; fi
     if grep -Eiq '^passwordauthentication yes' <<< "$SSHD"; then report INFO 'SSH password authentication enabled; consider keys and access controls.'; fi
-  else report UNKNOWN 'Unable to parse effective sshd configuration.'; fi
+  else report UNKNOWN 'Unable to parse effective sshd configuration.' 'Reason: sshd -T failed or returned unusable output. @@@ Next: inspect: sudo sshd -T; sudo sshd -t'; fi
 fi
 report INFO 'External reachability, router forwards, DNS mapping and upstream filtering cannot be established by local socket inspection.'
 
@@ -336,10 +377,10 @@ section '6. Disk, logs, memory and Raspberry Pi hardware'
 for path in / /var/log; do
   VAL=$(df -P "$path" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
   if [[ "$VAL" =~ ^[0-9]+$ ]]; then
-    if ((VAL>=95)); then report FAIL "$path filesystem at $VAL% usage."
-    elif ((VAL>=85)); then report WARN "$path filesystem at $VAL% usage."
+    if ((VAL>=95)); then report FAIL "$path filesystem at $VAL% usage." "Impact: writes, logs, package operations, and services can fail when the filesystem fills. @@@ Next: inspect: df -hP $path; identify large files before deleting anything."
+    elif ((VAL>=85)); then report WARN "$path filesystem at $VAL% usage." "Impact: free space is becoming limited. @@@ Next: inspect: df -hP $path; review growth and retention before deleting anything."
     else report PASS "$path filesystem at $VAL% usage."; fi
-  else report UNKNOWN "Could not read space usage for $path."; fi
+  else report UNKNOWN "Could not read space usage for $path." "Reason: df did not return a numeric usage percentage for $path. @@@ Next: inspect: df -hP $path"; fi
 done
 if have free; then
   MEM=$(free -m | awk '/^Mem:/ {print $7}')
@@ -353,7 +394,7 @@ if have vcgencmd; then
   TEMP=$(runquick vcgencmd measure_temp || true)
   TNUM=$(sed -n "s/.*=\([0-9][0-9]*\)\..*/\1/p" <<< "$TEMP")
   if [[ "$TNUM" =~ ^[0-9]+$ ]]; then
-    if ((TNUM>=80)); then report WARN "Pi temperature around ${TNUM} C."
+    if ((TNUM>=80)); then report WARN "Pi temperature around ${TNUM} C." 'Reason: the measured Raspberry Pi temperature is at or above the audit warning threshold. @@@ Impact: sustained heat can cause throttling. @@@ Next: inspect cooling/airflow and vcgencmd get_throttled.'
     else report INFO "Pi temperature around ${TNUM} C."; fi
   fi
   THROTTLE=$(runquick vcgencmd get_throttled || true)
@@ -368,7 +409,7 @@ if have vcgencmd; then
     elif ((VALUE!=0)); then
       report INFO "Raspberry Pi reports nonzero throttle flags outside the recognized current/history masks (get_throttled=$THROTTLE)."
     else report PASS 'No Pi throttling/undervoltage flags reported.'; fi
-  else report UNKNOWN 'Pi throttle flags unavailable.'; fi
+  else report UNKNOWN 'Pi throttle flags unavailable.' 'Reason: vcgencmd get_throttled did not return a recognized value. @@@ Next: if this hardware supports vcgencmd, inspect: vcgencmd get_throttled; otherwise this check may not apply.'; fi
 fi
 if have lsusb; then
   if runquick lsusb | grep -Eiq 'CM108|CM119|C-Media'; then report INFO 'USB C-Media audio interface detected (not proof of correct Asterisk mapping).'
@@ -405,19 +446,13 @@ if [[ -d /etc/asterisk ]]; then
     else report INFO "Asterisk configuration absent: $cfg (may be generated/included or optional)."; fi
   done
   if find /etc/asterisk -maxdepth 1 -type f \( -name '*.dpkg-dist' -o -name '*.ucf-dist' \) -print -quit 2>/dev/null | grep -q .; then
-    report WARN 'Asterisk directory has package-supplied configuration candidates (.dpkg-dist/.ucf-dist).' 'Compare carefully against live configuration; do not overwrite automatically.'
+    report INFO 'Asterisk directory has package-supplied configuration alternatives (.dpkg-dist/.ucf-dist).' 'These files are commonly left by Debian package handling when local Asterisk configuration is preserved instead of being overwritten. Their presence alone does not indicate a fault. Review them after significant package upgrades if you want to compare package defaults with the active local configuration.'
   fi
   DPKG_OLD_COUNT=$(find /etc/asterisk -maxdepth 1 -type f -name '*.dpkg-old' 2>/dev/null | wc -l)
   if ((DPKG_OLD_COUNT>0)); then
     report INFO "$DPKG_OLD_COUNT saved .dpkg-old Asterisk configuration file(s) found; these are backups, not unresolved merge candidates by themselves."
   fi
 fi
-for svc in analog_bridge mmdvm_bridge ircddbgateway ysfgateway p25gateway nxdngateway; do
-  if service_exists "$svc.service"; then
-    en=$(systemctl is-enabled "$svc.service" 2>/dev/null || true)
-    [[ "$en" == enabled ]] && ! service_active "$svc.service" && report WARN "$svc enabled at boot but not active." 'Verify whether this bridge is actually configured for use.'
-  fi
-done
 for port in 5038 8080 8443 9090; do
   if listen_tcp "$port"; then report INFO "TCP/$port listening locally (not proof of external reachability)."; fi
 done
@@ -455,7 +490,7 @@ if have certbot; then
       fi
     done < <(find -L /etc/letsencrypt/live -maxdepth 2 -name cert.pem -type f -print0 2>/dev/null)
     if ((expired>0)); then report FAIL "$expired local Let's Encrypt certificate(s) expired." 'To inspect: sudo certbot certificates'
-    elif ((soon>0)); then report WARN "$soon local Let's Encrypt certificate(s) expire within 14 days." 'To inspect certificates: sudo certbot certificates | To inspect timer: systemctl status certbot.timer --no-pager'
+    elif ((soon>0)); then report WARN "$soon local Let's Encrypt certificate(s) expire within 14 days." 'To inspect certificates: sudo certbot certificates @@@ To inspect timer: systemctl status certbot.timer --no-pager'
     elif ((certcount>0)); then report PASS "$certcount local Let's Encrypt certificate(s) valid beyond 14 days."
     else report INFO 'No readable cert.pem under the standard Let’s Encrypt live directory.'; fi
   fi
@@ -507,9 +542,9 @@ if have systemctl && service_exists firewalld.service; then
       if [[ -n "$fw_zones" ]]; then
         fw_names=$(awk 'NF==1 {printf "%s%s",sep,$1;sep=","}' <<< "$fw_zones")
         [[ -n "$fw_names" ]] && report INFO "Firewalld active zones: $fw_names (review permitted services/ports separately)."
-      else report UNKNOWN 'Firewalld active zones could not be determined.'; fi
+      else report UNKNOWN 'Firewalld active zones could not be determined.' 'Reason: firewall-cmd returned no active-zone information. @@@ Next: inspect: sudo firewall-cmd --get-active-zones; sudo firewall-cmd --list-all-zones'; fi
       report INFO 'To inspect Firewalld: sudo firewall-cmd --get-active-zones ; sudo firewall-cmd --list-all-zones'
-    else report UNKNOWN 'Firewalld is active but firewall-cmd was not found.'; fi
+    else report UNKNOWN 'Firewalld is active but firewall-cmd was not found.' 'Reason: systemd reports firewalld active, but the firewall-cmd client is unavailable. @@@ Next: verify: command -v firewall-cmd; dpkg-query -W firewalld'; fi
   fi
 fi
 if service_active fail2ban.service && have fail2ban-client; then
@@ -572,8 +607,8 @@ fi
 if have df; then
   inode_pct=$(df -Pi / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
   if [[ "$inode_pct" =~ ^[0-9]+$ ]]; then
-    if ((inode_pct>=95)); then report FAIL "Root filesystem inode use at ${inode_pct}%."
-    elif ((inode_pct>=85)); then report WARN "Root filesystem inode use at ${inode_pct}%."
+    if ((inode_pct>=95)); then report FAIL "Root filesystem inode use at ${inode_pct}%." 'Impact: new files can fail even if disk bytes remain free. @@@ Next: inspect: df -i /; identify directories creating unusually large numbers of files.'
+    elif ((inode_pct>=85)); then report WARN "Root filesystem inode use at ${inode_pct}%." 'Impact: inode capacity is becoming limited. @@@ Next: inspect: df -i /; review high-file-count directories.'
     else report PASS "Root filesystem inode use at ${inode_pct}%."; fi
   fi
 fi
@@ -639,7 +674,7 @@ if have systemctl; then
     report PASS 'No failed system services in systemd inventory.'
   fi
 else
-  report UNKNOWN 'systemctl unavailable; cannot enumerate services.'
+  report UNKNOWN 'systemctl unavailable; cannot enumerate services.' 'Reason: systemctl is unavailable. @@@ Impact: service inventory and failed-unit checks cannot be verified. @@@ Next: verify this is a systemd-based ASL3 installation.'
 fi
 if have loginctl; then
   user_mgrs=$(runquick loginctl list-users --no-legend 2>/dev/null | awk 'NF>=2 {n++} END {print n+0}' || true)
@@ -665,7 +700,7 @@ if have systemctl; then
     report WARN "$failed_timer_count systemd timer unit(s) in failed state." 'To inspect: systemctl --failed --type=timer --no-pager'
   fi
 else
-  report UNKNOWN 'Cannot inventory systemd timers without systemctl.'
+  report UNKNOWN 'Cannot inventory systemd timers without systemctl.' 'Reason: systemctl is unavailable. @@@ Impact: scheduled systemd work cannot be inventoried. @@@ Next: verify this is a systemd-based ASL3 installation.'
 fi
 if service_exists cron.service; then
   service_status cron.service 'Cron scheduler' optional
@@ -707,7 +742,9 @@ for interval in hourly daily weekly monthly yearly; do
       names+=("$b")
     done < <(find "$d" -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null | sort -z)
     report INFO "$d: ${#names[@]} candidate task(s)."
-    if ((${#names[@]}>0)); then printf '      %s\n' "${names[@]}"; fi
+    if ((${#names[@]}>0)); then
+      for name in "${names[@]}"; do printf '      %s\n' "$name"; done
+    fi
   fi
 done
 if root; then
@@ -734,7 +771,7 @@ if root; then
     done < <(printf '%s\n' "${!cron_users[@]}" | sort)
     report INFO "$cron_job_count scheduled crontab line(s) across $cron_user_count local account(s), including root when present."
   else
-    report UNKNOWN 'crontab command unavailable; per-user cron jobs not inspected.'
+    report UNKNOWN 'crontab command unavailable; per-user cron jobs not inspected.' 'Reason: the crontab command is unavailable. @@@ Impact: per-user cron schedules could not be enumerated. @@@ Next: verify the cron package if per-user cron is expected.'
   fi
 else
   report SKIP 'Per-user crontabs require root for comprehensive enumeration.'
@@ -752,7 +789,7 @@ report INFO "Kernel flavor: $flavor (comparisons only within this flavor)."
 if [[ -d "/lib/modules/$RUNNING_KERNEL" ]]; then
   report PASS "Matching module directory exists: /lib/modules/$RUNNING_KERNEL."
 else
-  report WARN 'Running kernel has no matching module directory.' 'Check: uname -r | Check: ls -ld /lib/modules/$(uname -r)'
+  report WARN 'Running kernel has no matching module directory.' 'Check: uname -r @@@ Check: ls -ld /lib/modules/$(uname -r)'
 fi
 if have dpkg-query; then
   for pkg in linux-image-rpi-2712 linux-image-rpi-v8 linux-base-rpi-2712 linux-base-rpi-v8 raspi-firmware rpi-eeprom; do
@@ -811,7 +848,7 @@ if have ps; then
   fi
   high=$(ps -eo pid=,comm=,pcpu= --sort=-pcpu 2>/dev/null | awk '$3+0 >= 85 {print $1":"$2"("$3"%)"}' | head -n 5 | paste -sd ', ' -)
   if [[ -n "$high" ]]; then report INFO "Very high CPU processes observed in this snapshot: $high; high CPU alone is not evidence of mining." 'Inspect: ps -eo pid,comm,pcpu,pmem --sort=-pcpu | head -n 20'; fi
-else report UNKNOWN 'ps unavailable; cannot examine running processes.'; fi
+else report UNKNOWN 'ps unavailable; cannot examine running processes.' 'Reason: the ps command is unavailable. @@@ Impact: the mining/process screen is incomplete. @@@ Next: verify procps is installed: dpkg-query -W procps'; fi
 if have ss; then
   # Port numbers are weak indicators. No remote addresses or URLs are included.
   mining_ports=$(runquick ss -Hnt state established 2>/dev/null | awk '{print $5}' | sed -nE 's/.*:([0-9]+)$/\1/p' | grep -E '^(3333|4444|5555|7777|14444|14433)$' | sort -u | paste -sd ',' - || true)
@@ -829,26 +866,25 @@ fi
 report INFO 'Cron jobs and timers are inventoried in section 13; automatic analysis of their commands is intentionally limited to avoid exposing credentials.'
 report INFO 'A security scan cannot confirm a system is uncompromised. Unexpected load, users, files, network connections and persistence merit targeted investigation.'
 
+# Freeze authoritative totals after Sections 1-15 so CLI and web counters match exactly.
+AUDIT_PASS=$PASS; AUDIT_WARN=$WARN; AUDIT_FAIL=$FAIL; AUDIT_INFO=$INFO; AUDIT_SKIP=$SKIP; AUDIT_UNKNOWN=$UNKNOWN
+
 section '16. Priority findings and limitations' 
-if ((${#FINDINGS[@]})); then
+if ((${#FINDING_LEVELS[@]})); then
   printf '  Actionable findings first (no automatic fixes):\n'
-  for entry in "${FINDINGS[@]}"; do
-    IFS='|' read -r severity message hint <<< "$entry"
-    printf '    %-7s %s\n' "$severity" "$message"
-    if [[ -n "$hint" ]]; then
-      IFS='|' read -ra parts <<< "$hint"
-      for part in "${parts[@]}"; do
-        part="${part# }"; part="${part% }"
-        printf '            %s\n' "$part"
-      done
-    fi
+  for ((i=0; i<${#FINDING_LEVELS[@]}; i++)); do
+    printf '    %-7s %s\n' "${FINDING_LEVELS[$i]}" "${FINDING_MESSAGES[$i]}"
+    print_hint "${FINDING_HINTS[$i]}"
   done
 else
   printf '  No warnings, failures or unknown results in the checks executed.\n'
 fi
 
 section '17. Report limitations and summary'
-report INFO 'This tool does not modify the node, test live radio audio, externally probe ports, or verify every application-specific config.'
-report INFO 'Review all WARN/FAIL items before taking action; service/port absence may be intentional.'
-printf '\nTOTAL: %d PASS | %d WARN | %d FAIL | %d INFO | %d SKIP | %d UNKNOWN\n' "$PASS" "$WARN" "$FAIL" "$INFO" "$SKIP" "$UNKNOWN"
-if ((FAIL>0)); then exit 1; elif ((WARN>0 || UNKNOWN>0)); then exit 3; else exit 0; fi
+printf '  [LIMIT ] This tool does not modify the node, test live radio audio, externally probe ports, or verify every application-specific configuration.\n'
+printf '  [LIMIT ] WARN/FAIL/UNKNOWN results describe observed evidence; use the supplied reason/next-step guidance before making changes.\n'
+printf '\nTOTAL: %d PASS | %d WARN | %d FAIL | %d INFO | %d SKIP | %d UNKNOWN\n' "$AUDIT_PASS" "$AUDIT_WARN" "$AUDIT_FAIL" "$AUDIT_INFO" "$AUDIT_SKIP" "$AUDIT_UNKNOWN"
+# Finding severity is carried in the report and counters. A completed audit exits 0.
+# Nonzero exit codes are reserved for invocation/runtime failures so a WARN/FAIL/UNKNOWN
+# cannot terminate an operator's interactive shell when `errexit` is enabled.
+exit 0

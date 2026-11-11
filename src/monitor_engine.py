@@ -26,10 +26,13 @@ def add(key, name, status, detail, *, alarm=False):
     checks.append(dict(id=key, name=name, status=status, detail=detail,
                        security_alarm=bool(alarm and status == 'FAIL')))
 
-def service(unit, title, security=False):
+def service(unit, title, *, required=False, security=False):
     code, loaded = run('systemctl', 'show', '--property=LoadState', '--value', unit)
     if code != 0 or loaded != 'loaded':
-        add(unit, title, 'UNKNOWN', 'Service not installed or status could not be established.')
+        if required:
+            add(unit, title, 'FAIL', 'Required service is not installed or systemd could not load the unit definition.')
+        else:
+            add(unit, title, 'INFO', 'Service is not installed as a loaded systemd unit; this may be intentional for this node.')
         return
     _, active = run('systemctl', 'is-active', unit)
     _, enabled = run('systemctl', 'is-enabled', unit)
@@ -37,20 +40,31 @@ def service(unit, title, security=False):
     enabled = enabled.splitlines()[0] if enabled else 'unknown'
     if active == 'active':
         add(unit, title, 'PASS', 'Active (startup: %s).' % enabled)
-    elif enabled == 'enabled' and security:
-        add(unit, title, 'FAIL', 'Enabled protection service is %s.' % active, alarm=True)
-    elif enabled == 'enabled':
-        add(unit, title, 'WARN', 'Enabled service is %s.' % active)
+    elif active == 'failed':
+        if required:
+            add(unit, title, 'FAIL', 'Required service is in the failed state. Inspect: systemctl status %s --no-pager' % unit,
+                alarm=security)
+        elif security and enabled == 'enabled':
+            add(unit, title, 'FAIL', 'Enabled protection service is failed. Inspect: systemctl status %s --no-pager' % unit,
+                alarm=True)
+        else:
+            add(unit, title, 'WARN', 'Service is failed but is role-dependent/optional. Inspect whether this node is intended to use it: systemctl status %s --no-pager' % unit)
+    elif required:
+        add(unit, title, 'FAIL', 'Required service is %s (startup: %s). Inspect: systemctl status %s --no-pager' % (active, enabled, unit),
+            alarm=security)
+    elif security and enabled == 'enabled':
+        add(unit, title, 'FAIL', 'Protection service is enabled but %s. Inspect: systemctl status %s --no-pager' % (active, unit),
+            alarm=True)
     else:
-        add(unit, title, 'INFO', 'Not active (startup: %s); may be intentional.' % enabled)
+        add(unit, title, 'INFO', 'Not active (state: %s, startup: %s); role-dependent inactivity may be intentional.' % (active, enabled))
 
 if os.geteuid() != 0:
     raise SystemExit('STOP: Security collector requires root for reliable checks.')
 
 service('fail2ban.service', 'Fail2Ban protection', security=True)
 service('firewalld.service', 'Firewalld protection', security=True)
-service('apache2.service', 'Apache web service')
-service('asterisk.service', 'Asterisk service')
+service('apache2.service', 'Apache web service', required=True)
+service('asterisk.service', 'Asterisk service', required=True)
 
 manager = Path('/etc/asterisk/manager.conf')
 try:
@@ -133,8 +147,20 @@ if apt_security['status'] == 'CHECKED':
         f'{count} pending Debian security-related upgrade(s); {apt_security["other_count"]} other upgrade(s). '
         'No packages installed by this audit.')
 else:
-    add('debian.security-updates', 'Debian security updates', 'UNKNOWN',
-        apt_security['reason'] + ' Do not interpret as zero security updates.')
+    detail = apt_security['reason'] + ' Do not interpret this as zero security updates.'
+    problem = apt_security.get('refresh_problem')
+    if isinstance(problem, dict):
+        if problem.get('repository'):
+            detail += ' Affected repository: ' + str(problem['repository']) + '.'
+        if problem.get('impact'):
+            detail += ' Impact: ' + str(problem['impact'])
+        if problem.get('action'):
+            detail += ' Next: ' + str(problem['action'])
+        if problem.get('verify'):
+            detail += ' Verify: ' + str(problem['verify'])
+    else:
+        detail += ' Next: run sudo apt-get -o APT::Update::Error-Mode=any update and correct any reported error.'
+    add('debian.security-updates', 'Debian security updates', 'UNKNOWN', detail)
 
 now = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
 counts = {level: sum(item['status'] == level for item in checks)

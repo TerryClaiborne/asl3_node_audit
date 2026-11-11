@@ -51,9 +51,11 @@ def parse_report(report: str) -> dict:
             level,text=match.group(1),match.group(2).strip()
             section['rows'].append({'kind':'result','level':level,'text':text,'detail':[]})
             section['severity'][level]+=1
-            if level in ('WARN','FAIL','UNKNOWN') and section['number'] not in (16,17):
-                findings.append({'level':level,'message':text,'section':section['number']})
         elif line.strip():
+            stripped=line.strip()
+            if section.get('number')==2 and (stripped.startswith('Debian security monitor') or
+                    stripped.startswith(('CHECKED:','UNVERIFIED:','Reason:','Affected repository:','Impact:','Next:','Verify:'))):
+                continue
             if (section['rows'] and section['rows'][-1]['kind']=='result'
                     and len(line)-len(line.lstrip())>=10):
                 section['rows'][-1]['detail'].append(line.strip()[:500])
@@ -67,10 +69,13 @@ def parse_report(report: str) -> dict:
         raise ValueError('Expected all 15 diagnostic sections')
     if totals is None or audit_version is None:raise ValueError('Incomplete CLI report')
     expected={k:sum(s['severity'][k] for s in sections) for k in SEV}
-    # Original CLI includes two additional INFO entries in sections 17 and may
-    # include non-section summary rows. Do not infer equality from this alone.
-    if any(totals[k]<expected[k] for k in SEV):
-        raise ValueError('Counter inconsistency')
+    if totals != expected:
+        raise ValueError(f'Counter inconsistency: CLI={totals} sections={expected}')
+    for sec in sections:
+        for row in sec['rows']:
+            if row.get('kind')=='result' and row.get('level') in ('WARN','FAIL','UNKNOWN'):
+                findings.append({'level':row['level'],'message':row['text'],'section':sec['number'],
+                                 'detail':list(row.get('detail') or [])[:8]})
     return {'schema':1,'kind':'full_audit','coverage':'FULL','engine':'cli-adapter',
             'version':audit_version,'checked_at_utc':utc().isoformat(),
             'status':'CURRENT','totals':expected,'sections':sections,'findings':findings}
@@ -109,13 +114,12 @@ def collect(force=False):
     except subprocess.TimeoutExpired:
         print('WARNING: Full audit exceeded time limit; previous snapshot remains timestamped',file=sys.stderr)
         return 3
-    # Exit 3 means WARN/UNKNOWN, exit 1 means audited FAIL; both may be valid.
-    if p.returncode not in (0,1,3):
-        print(f'WARNING: CLI exited unexpectedly ({p.returncode})',file=sys.stderr);return 3
+    # Finding severity is parsed from the validated report. Nonzero CLI status means
+    # an invocation/runtime failure, never merely WARN/FAIL/UNKNOWN findings.
+    if p.returncode != 0:
+        print(f'WARNING: CLI execution failed ({p.returncode})',file=sys.stderr);return 3
     try:
         result=parse_report(p.stdout)
-        if result['totals']['FAIL']==0 and p.returncode==1:
-            raise ValueError('CLI exit code/report mismatch')
         safe_write(FEED,result,0o640)
     except (ValueError,OSError) as e:
         print('WARNING: Full audit validation failed:',e,file=sys.stderr);return 3
@@ -127,7 +131,7 @@ def self_test():
     for i in range(1,16):
         sample+=f'\n=== {i}. Section {i} ===\n  [PASS   ] healthy\n'
         if i==13:sample+='    Timer unit                                Startup      Active\n      apt-daily.timer                          enabled      active\n'
-    sample+='\n=== 16. Priority findings ===\n=== 17. Report limitations ===\n  [INFO   ] limitation row outside dashboard cards\nTOTAL: 15 PASS | 0 WARN | 0 FAIL | 1 INFO | 0 SKIP | 0 UNKNOWN\n'
+    sample+='\n=== 16. Priority findings ===\n=== 17. Report limitations ===\n  [INFO   ] limitation row outside dashboard cards\nTOTAL: 15 PASS | 0 WARN | 0 FAIL | 0 INFO | 0 SKIP | 0 UNKNOWN\n'
     got=parse_report(sample)
     assert len(got['sections'])==15 and got['totals']['PASS']==15 and got['totals']['INFO']==0
     assert any(r['kind']=='columns' and len(r['cells'])==3 for r in got['sections'][12]['rows'])

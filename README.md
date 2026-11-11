@@ -1,14 +1,16 @@
 # ASL3 Node Audit
 
-ASL3 Node Audit is a read-only diagnostic dashboard for an AllStarLink 3 node. It combines live system information with a scheduled 15-section audit covering ASL3, Asterisk, Debian packages, networking, security, storage, services, scheduled tasks, kernel/firmware, DVSwitch-related components, and other node health information.
+ASL3 Node Audit is a read-only diagnostic dashboard for an AllStarLink 3 node. It combines live system information with a browser-triggered 15-section audit covering ASL3, Asterisk, Debian packages, networking, security, storage, services, scheduled tasks, kernel/firmware, DVSwitch-related components, and other node health information.
 
-It is a diagnostic tool. It does not automatically repair configuration, install upgrades, reboot the node, change radio settings, or modify other applications. Its scheduled security check does refresh Debian APT package metadata so update information stays current; it does not install or upgrade packages.
+It is a diagnostic tool. It does not automatically repair configuration, install upgrades, reboot the node, change radio settings, or modify other applications. Its bounded security check refreshes Debian APT package metadata when needed so update information stays current; it does not install or upgrade packages.
 
 ## What it provides
 
 - 15 detailed diagnostic sections with PASS, WARN, FAIL, INFO, SKIP, and UNKNOWN results.
+- Actionable WARN/FAIL/UNKNOWN findings that preserve the observed reason and next-step guidance instead of hiding the cause behind a generic status.
+- Role-aware service reporting: required services are treated differently from optional/conditional services, and an optional service that is cleanly inactive is not automatically a warning.
 - Live CPU, RAM, network, temperature, uptime, disk, load, LAN IP, and local node information.
-- Current Debian security-update information.
+- Current Debian security-update information as a separate verified status. If APT cannot verify it, the dashboard reports the failure category, affected repository host when identifiable, impact, suggested action, and verification command rather than implying a clean result.
 - Automatic local node detection from ASL3/Asterisk configuration.
 - Dark and light display modes.
 - Optional application login with a password-only login screen.
@@ -182,6 +184,17 @@ Uninstall disables/removes only ASL3 Node Audit's systemd units and Apache confi
 - `bin/` - audit and scheduled-monitor programs.
 - `run/` - generated private runtime state; never commit this directory.
 
+## Reporting model
+
+The 15-section audit and Debian security-update verification are intentionally separate scopes:
+
+- The six dashboard counters and **Priority audit findings** count come only from Sections 1-15 of the full audit. The command-line `TOTAL` uses the same scope, so the CLI and UI counters match.
+- Debian security-update status is displayed separately. Pending security updates do not silently increase the full-audit WARN count.
+- If APT metadata cannot be refreshed or security updates cannot be classified, the result is **not verified** and the reason is shown. Known failure classes include repository-signature policy, DNS, TLS, network reachability, invalid repository configuration, APT lock contention, timeout, and command-execution failure.
+- A cleanly inactive optional/role-dependent service is informational. A service in the actual systemd `failed` state remains a warning, and a required service that is missing, failed, or inactive is a failure.
+
+The audit does not claim that an unknown state is healthy. It reports what could not be established and provides a next inspection or verification step where the check can do so safely.
+
 ## Dashboard refresh
 
 Opening the dashboard starts a full audit immediately. While the page remains open, it refreshes every 5 minutes. Closing the page stops browser-triggered audits.
@@ -195,6 +208,8 @@ sudo bash /var/www/html/asl3_node_audit/bin/asl3-node-audit.sh --full --no-color
 ```
 
 Other options: `--summary-first`, `--version`, and `--help`.
+
+A completed audit exits successfully even when it reports WARN, FAIL, or UNKNOWN findings; finding severity is carried in the report itself. Nonzero process exit codes are reserved for invocation or runtime failures, so running the audit cannot terminate an operator shell merely because the audit found a problem.
 
 ## Troubleshooting
 
@@ -217,4 +232,13 @@ Check recent monitor messages:
 journalctl -u asl3-node-audit.service -n 100 --no-pager
 ```
 
-If `MYNODE` could not be detected, set it manually in `config.ini` and rerun setup. If the dashboard reports that security updates are unverified, run `sudo apt-get update` manually and inspect any repository errors before assuming the system is current.
+If `MYNODE` could not be detected, set it manually in `config.ini` and rerun setup. If Debian security-update verification cannot complete, the dashboard shows the reason and suggested next step. The direct verification command is:
+
+```bash
+sudo apt-get -o APT::Update::Error-Mode=any update
+```
+
+Correct the reported repository/network/signature problem rather than disabling APT signature verification. After correction, the next Node Audit security cycle will republish the verified status.
+
+
+Setup performs installation and self-tests only; it does not block on a full system audit or APT refresh. The dashboard requests a fresh audit when it opens.

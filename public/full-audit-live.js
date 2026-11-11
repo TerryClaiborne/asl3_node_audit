@@ -78,7 +78,11 @@ function findings(items){
  for(const info of items){if(![1,2,3,4,5,6,7,8,9,10,11,12,13,14,15].includes(info.section))continue;
    const b=el('button','finding');b.type='button';b.dataset.openSection=info.section;
    const level=LEVELS.has(info.level)?info.level:'UNKNOWN';
-   b.append(el('span',`tag ${level.toLowerCase()}`,level),el('span','',info.message),el('span','arrow','View details ↗'));
+   const copy=el('span','finding-copy');copy.appendChild(el('span','finding-message',info.message));
+   if(Array.isArray(info.detail)&&info.detail.length){
+     const useful=info.detail.slice(0,3).join(' · ');copy.appendChild(el('span','finding-detail',useful));
+   }
+   b.append(el('span',`tag ${level.toLowerCase()}`,level),copy,el('span','arrow','View details ↗'));
    b.onclick=()=> $(`.tile[data-section="${info.section}"]`)?.click();
    body.appendChild(b);
  }
